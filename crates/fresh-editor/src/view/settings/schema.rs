@@ -84,6 +84,8 @@ pub struct SettingSchema {
     pub enum_from: Option<String>,
     /// Path to the sibling dual-list setting (for cross-exclusion)
     pub dual_list_sibling: Option<String>,
+    /// Whether this field can be dynamically extended with runtime options (e.g., custom tokens from plugins)
+    pub dynamicly_extendable_status_bar_elements: bool,
 }
 
 /// Type of a setting, determines which control to render
@@ -216,6 +218,9 @@ struct RawSchema {
     /// Path to the sibling dual-list setting (for cross-exclusion)
     #[serde(rename = "x-dual-list-sibling")]
     dual_list_sibling: Option<String>,
+    /// Whether this field can be dynamically extended with runtime options (e.g., custom tokens from plugins)
+    #[serde(rename = "x-dynamicly-extendable-status-bar-elements", default)]
+    dynamicly_extendable_status_bar_elements: bool,
 }
 
 /// An entry in the x-enum-values array
@@ -483,6 +488,7 @@ fn parse_setting(
             .dual_list_sibling
             .clone()
             .or_else(|| resolved.dual_list_sibling.clone()),
+        dynamicly_extendable_status_bar_elements: schema.dynamicly_extendable_status_bar_elements || resolved.dynamicly_extendable_status_bar_elements,
     }
 }
 

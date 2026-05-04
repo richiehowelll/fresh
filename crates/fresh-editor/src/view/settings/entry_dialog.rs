@@ -1308,6 +1308,7 @@ mod tests {
                         nullable: false,
                         enum_from: None,
                         dual_list_sibling: None,
+                        dynamicly_extendable_status_bar_elements: false,
                     },
                     SettingSchema {
                         path: "/command".to_string(),
@@ -1321,6 +1322,7 @@ mod tests {
                         nullable: false,
                         enum_from: None,
                         dual_list_sibling: None,
+                        dynamicly_extendable_status_bar_elements: false,
                     },
                 ],
             },
@@ -1331,6 +1333,7 @@ mod tests {
             nullable: false,
             enum_from: None,
             dual_list_sibling: None,
+            dynamicly_extendable_status_bar_elements: false,
         }
     }
 

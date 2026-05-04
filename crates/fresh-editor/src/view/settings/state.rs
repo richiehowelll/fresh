@@ -3099,6 +3099,7 @@ mod tests {
                     nullable: false,
                     enum_from: None,
                     dual_list_sibling: None,
+                    dynamicly_extendable_status_bar_elements: false,
                 }],
             },
             default: None,
@@ -3108,6 +3109,7 @@ mod tests {
             nullable: false,
             enum_from: None,
             dual_list_sibling: None,
+            dynamicly_extendable_status_bar_elements: false,
         };
 
         // universal_lsp's value schema: ObjectArray of the item schema above.
@@ -3129,6 +3131,7 @@ mod tests {
             nullable: false,
             enum_from: None,
             dual_list_sibling: None,
+            dynamicly_extendable_status_bar_elements: false,
         };
 
         // Parent dialog: user is editing the existing "quicklsp" entry

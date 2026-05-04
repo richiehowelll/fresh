@@ -730,13 +730,13 @@ pub struct StatusBarConfig {
     /// Elements shown on the left side of the status bar.
     /// Default: ["{filename}", "{cursor}", "{diagnostics}", "{cursor_count}", "{messages}"]
     #[serde(default = "default_status_bar_left")]
-    #[schemars(extend("x-section" = "Status Bar", "x-dual-list-sibling" = "/editor/status_bar/right"))]
+    #[schemars(extend("x-section" = "Status Bar", "x-dual-list-sibling" = "/editor/status_bar/right", "x-dynamicly-extendable-status-bar-elements" = true))]
     pub left: Vec<StatusBarElement>,
 
     /// Elements shown on the right side of the status bar.
     /// Default: ["{line_ending}", "{encoding}", "{language}", "{lsp}", "{warnings}", "{update}", "{palette}"]
     #[serde(default = "default_status_bar_right")]
-    #[schemars(extend("x-section" = "Status Bar", "x-dual-list-sibling" = "/editor/status_bar/left"))]
+    #[schemars(extend("x-section" = "Status Bar", "x-dual-list-sibling" = "/editor/status_bar/left", "x-dynamicly-extendable-status-bar-elements" = true))]
     pub right: Vec<StatusBarElement>,
 }
 
