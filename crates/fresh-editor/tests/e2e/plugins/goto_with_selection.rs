@@ -130,7 +130,7 @@ fn verify_selection_contains_only(harness: &mut EditorTestHarness, expected_line
                 line,
                 screen
             );
-}
+        }
     }
 }
 
