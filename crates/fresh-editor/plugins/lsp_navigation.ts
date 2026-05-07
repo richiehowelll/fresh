@@ -1,15 +1,5 @@
 /// <reference path="./lib/fresh.d.ts" />
 
-class MyClass {
-  constructor() {
-    return true;
-  }
-
-  myMethod(a: number): number {
-    return a;
-  }
-}
-
 import { Finder, FilterSource, defaultFuzzyFilter } from "./lib/finder.ts";
 
 interface SymbolItem {
@@ -109,6 +99,8 @@ async function loadSymbols(filePath: string, language: string): Promise<SymbolIt
 
     return symbols;
   } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    editor.setStatus(`LSP symbols failed: ${msg}`);
     return [];
   }
 }
