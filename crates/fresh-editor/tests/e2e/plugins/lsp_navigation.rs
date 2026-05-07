@@ -128,9 +128,7 @@ done
     harness.open_file(&test_file)?;
     harness.process_async_and_render()?;
 
-    for _ in 0..5 {
-        harness.process_async_and_render()?;
-    }
+    harness.wait_until(|h| h.screen_to_string().contains("LSP (on)"))?;
 
     harness.send_key(KeyCode::Char('p'), KeyModifiers::CONTROL)?;
     harness.process_async_and_render()?;
