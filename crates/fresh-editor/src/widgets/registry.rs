@@ -55,17 +55,30 @@ pub struct HitArea {
 /// `WidgetSpec` from scratch on every model change without losing
 /// scroll offset, cursor position, expanded keys, or focus, because
 /// stateful widgets look up their instance state by `key`.
-///
-/// In v1 only `List` carries instance state (its scroll offset).
-/// `TextInput` cursor and `Tree` expanded-keys live here once those
-/// widgets become host-stateful.
 #[derive(Debug, Clone, Default)]
 pub enum WidgetInstanceState {
     /// Empty/placeholder — never persisted, used as a default.
     #[default]
     None,
-    /// `List` instance state: the host-owned scroll offset.
-    List { scroll_offset: u32 },
+    /// `List` instance state: host-owned scroll offset *and*
+    /// selected index. `selected_index` becomes authoritative
+    /// after first render — same correctness reasoning as
+    /// `TextInput`'s host-owned value (host can mutate it via
+    /// `WidgetCommand::SelectMove` without racing the plugin's
+    /// spec round-trip).
+    List {
+        scroll_offset: u32,
+        selected_index: i32,
+    },
+    /// `TextInput` instance state: host-owned value + cursor byte
+    /// offset. Becomes authoritative once the widget mounts; the
+    /// spec's `value` / `cursor_byte` are *initial-only* (used at
+    /// first render and ignored thereafter). This guarantees
+    /// correctness under concurrent keystrokes — the plugin's
+    /// spec round-trip can't race against multiple in-flight
+    /// `WidgetCommand` mutations because the host doesn't read
+    /// from the spec for value at all once instance state exists.
+    TextInput { value: String, cursor_byte: u32 },
 }
 
 /// Per-panel state retained between renders. The reconciler will use
@@ -204,6 +217,13 @@ impl WidgetRegistry {
     /// Read-only access to a panel's current state.
     pub fn get(&self, panel_id: PanelId) -> Option<&WidgetPanelState> {
         self.panels.get(&panel_id)
+    }
+
+    /// Mutable access — used by `WidgetCommand` handlers that
+    /// update widget instance state (e.g. TextInput value/cursor)
+    /// directly without round-tripping through the plugin.
+    pub fn get_mut(&mut self, panel_id: PanelId) -> Option<&mut WidgetPanelState> {
+        self.panels.get_mut(&panel_id)
     }
 
     /// All currently-mounted panel ids — useful for theme-change

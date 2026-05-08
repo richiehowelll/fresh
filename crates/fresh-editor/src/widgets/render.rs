@@ -293,28 +293,43 @@ fn render_collected(
             visible_rows,
             key: list_key,
         } => {
-            // Compute the visible window. The scroll offset comes
-            // from previous instance state (or 0 on first render),
-            // then auto-clamps so:
-            //   * `selected_index` is in view (scroll up if it's
-            //     above the window, scroll down if it's below);
-            //   * the window doesn't extend past `items.len()`
-            //     (the bottom of the dataset doesn't leave a half-
-            //     empty viewport when items are abundant);
-            //   * scroll never goes negative.
+            // Look up host-owned scroll + selected index from prev
+            // state (becomes authoritative after first render).
+            // Spec's `selected_index` is initial-only on first
+            // mount; subsequent updates read instance state.
             let total = items.len() as u32;
             let visible = (*visible_rows).max(1);
-            let prev_scroll = list_key
+            let (prev_scroll, prev_sel) = list_key
                 .as_deref()
                 .and_then(|k| prev.get(k))
                 .and_then(|s| match s {
-                    WidgetInstanceState::List { scroll_offset } => Some(*scroll_offset),
+                    WidgetInstanceState::List {
+                        scroll_offset,
+                        selected_index,
+                    } => Some((*scroll_offset, *selected_index)),
                     _ => None,
                 })
-                .unwrap_or(0);
+                .unwrap_or((0, *selected_index));
+            // Clamp the previous selection to the current dataset
+            // size — items may have shrunk between renders (e.g.
+            // search results changed). Out-of-range selections
+            // collapse to the last item, or -1 if the list is
+            // now empty.
+            let effective_sel = if prev_sel < 0 {
+                -1
+            } else if total == 0 {
+                -1
+            } else if (prev_sel as u32) >= total {
+                (total - 1) as i32
+            } else {
+                prev_sel
+            };
+
+            // Compute scroll: auto-clamp to keep selection in view
+            // and never extend past the dataset end.
             let mut scroll = prev_scroll;
-            if *selected_index >= 0 {
-                let sel = *selected_index as u32;
+            if effective_sel >= 0 {
+                let sel = effective_sel as u32;
                 if sel < scroll {
                     scroll = sel;
                 }
@@ -322,23 +337,18 @@ fn render_collected(
                     scroll = sel + 1 - visible;
                 }
             }
-            // Clamp against dataset size — but only when there's
-            // more data than the viewport. With < visible items
-            // we must not push scroll backwards (that would land
-            // a viewport above row 0, leaving blank rows on top).
             let max_scroll = total.saturating_sub(visible);
             if scroll > max_scroll {
                 scroll = max_scroll;
             }
-            // Persist scroll for the next render. Lists without a
-            // `key` lose scroll across updates — document this in
-            // the spec, and matched behaviour for any other future
-            // widget that wants to opt out of state preservation.
+            // Persist scroll + selection for the next render.
+            // Lists without a `key` lose state across updates.
             if let Some(k) = list_key.as_deref() {
                 next_state.insert(
                     k.to_string(),
                     WidgetInstanceState::List {
                         scroll_offset: scroll,
+                        selected_index: effective_sel,
                     },
                 );
             }
@@ -352,7 +362,7 @@ fn render_collected(
             let end = ((scroll + visible) as usize).min(items.len());
             for i in start..end {
                 let mut entry = items[i].clone();
-                let is_selected = i as i32 == *selected_index;
+                let is_selected = i as i32 == effective_sel;
                 if is_selected {
                     let mut style = entry.style.unwrap_or_default();
                     style.bg = Some(OverlayColorSpec::theme_key(KEY_FOCUSED_BG));
@@ -390,13 +400,43 @@ fn render_collected(
                 Some(k) if !k.is_empty() => k == focus_key,
                 _ => *focused,
             };
+            // Host-owned value/cursor: read instance state if it
+            // exists; else seed from spec on first render. This is
+            // what makes concurrent keystroke dispatch correct —
+            // see WidgetInstanceState::TextInput doc.
+            let (effective_value, effective_cursor_byte) = match key
+                .as_deref()
+                .filter(|k| !k.is_empty())
+                .and_then(|k| prev.get(k))
+            {
+                Some(WidgetInstanceState::TextInput { value, cursor_byte }) => {
+                    (value.clone(), *cursor_byte as i32)
+                }
+                _ => (value.clone(), *cursor_byte),
+            };
+            if let Some(k) = key.as_deref().filter(|k| !k.is_empty()) {
+                let cb = effective_cursor_byte
+                    .max(0)
+                    .min(effective_value.len() as i32) as u32;
+                next_state.insert(
+                    k.to_string(),
+                    WidgetInstanceState::TextInput {
+                        value: effective_value.clone(),
+                        cursor_byte: cb,
+                    },
+                );
+            }
             // When focus moves away from a TextInput, hide the
             // cursor — the spec's `cursor_byte` stays around for
             // the plugin's bookkeeping but visually a non-focused
             // input shouldn't display a cursor.
-            let effective_cursor = if is_focused { *cursor_byte } else { -1 };
+            let effective_cursor = if is_focused {
+                effective_cursor_byte
+            } else {
+                -1
+            };
             entries.push(render_text_input(
-                value,
+                &effective_value,
                 effective_cursor,
                 is_focused,
                 label,
@@ -1362,7 +1402,9 @@ mod tests {
     #[test]
     fn list_scrolls_to_keep_selected_below_window_in_view() {
         // 10 items, visible=3, select index 5: scroll should be 3
-        // (so selected lands at the bottom of the window).
+        // (so selected lands at the bottom of the window). On
+        // *first* render (empty prev), the spec's selected_index
+        // seeds instance state.
         let spec = make_list(5, 3, 10, Some("L"));
         let (_entries, hits, state) = render_no_focus(&spec, &HashMap::new());
         // Visible window is items 3..6 → hits index 3, 4, 5.
@@ -1370,7 +1412,7 @@ mod tests {
         assert_eq!(hits[0].payload["index"], 3);
         assert_eq!(hits[2].payload["index"], 5);
         let scroll = match state.get("L").unwrap() {
-            WidgetInstanceState::List { scroll_offset } => *scroll_offset,
+            WidgetInstanceState::List { scroll_offset, .. } => *scroll_offset,
             _ => unreachable!(),
         };
         assert_eq!(scroll, 3);
@@ -1378,15 +1420,25 @@ mod tests {
 
     #[test]
     fn list_scrolls_to_keep_selected_above_window_in_view() {
-        // Previous render scrolled to 5; new selection is 1; widget
-        // should scroll back up to 1.
+        // Previous render scrolled to 5 with selection at 5; user
+        // pressed Up enough times that select_move set instance
+        // state's selection to 1; renderer should scroll back up
+        // to 1. (Spec's selected_index is initial-only; instance
+        // state is authoritative once present.)
         let mut prev = HashMap::new();
-        prev.insert("L".into(), WidgetInstanceState::List { scroll_offset: 5 });
-        let spec = make_list(1, 3, 10, Some("L"));
+        prev.insert(
+            "L".into(),
+            WidgetInstanceState::List {
+                scroll_offset: 5,
+                selected_index: 1,
+            },
+        );
+        // Spec's selected_index doesn't matter (instance state wins).
+        let spec = make_list(99, 3, 10, Some("L"));
         let (_entries, hits, state) = render_no_focus(&spec, &prev);
         assert_eq!(hits[0].payload["index"], 1);
         let scroll = match state.get("L").unwrap() {
-            WidgetInstanceState::List { scroll_offset } => *scroll_offset,
+            WidgetInstanceState::List { scroll_offset, .. } => *scroll_offset,
             _ => unreachable!(),
         };
         assert_eq!(scroll, 1);
@@ -1394,15 +1446,21 @@ mod tests {
 
     #[test]
     fn list_scroll_preserved_when_selection_remains_in_view() {
-        // Previous render scrolled to 4; new selection 5 (still in
-        // window 4..6); scroll stays at 4.
+        // Previous render scrolled to 4 with selection at 4; user
+        // moved selection to 5 (still in window 4..6); scroll stays.
         let mut prev = HashMap::new();
-        prev.insert("L".into(), WidgetInstanceState::List { scroll_offset: 4 });
-        let spec = make_list(5, 3, 10, Some("L"));
+        prev.insert(
+            "L".into(),
+            WidgetInstanceState::List {
+                scroll_offset: 4,
+                selected_index: 5,
+            },
+        );
+        let spec = make_list(99, 3, 10, Some("L"));
         let (_entries, hits, state) = render_no_focus(&spec, &prev);
         assert_eq!(hits[0].payload["index"], 4);
         let scroll = match state.get("L").unwrap() {
-            WidgetInstanceState::List { scroll_offset } => *scroll_offset,
+            WidgetInstanceState::List { scroll_offset, .. } => *scroll_offset,
             _ => unreachable!(),
         };
         assert_eq!(scroll, 4);
@@ -1413,12 +1471,12 @@ mod tests {
         // Previous scroll past the end of a now-shorter dataset
         // clamps to max_scroll = total - visible.
         let mut prev = HashMap::new();
-        prev.insert("L".into(), WidgetInstanceState::List { scroll_offset: 8 });
+        prev.insert("L".into(), WidgetInstanceState::List { scroll_offset: 8, selected_index: -1 });
         let spec = make_list(-1, 3, 5, Some("L"));
         let (entries, _hits, state) = render_no_focus(&spec, &prev);
         assert_eq!(entries.len(), 3);
         let scroll = match state.get("L").unwrap() {
-            WidgetInstanceState::List { scroll_offset } => *scroll_offset,
+            WidgetInstanceState::List { scroll_offset, .. } => *scroll_offset,
             _ => unreachable!(),
         };
         // total=5, visible=3 → max=2.
@@ -1431,7 +1489,7 @@ mod tests {
         let (entries, _hits, state) = render_no_focus(&spec, &HashMap::new());
         assert_eq!(entries.len(), 3, "all items fit");
         let scroll = match state.get("L").unwrap() {
-            WidgetInstanceState::List { scroll_offset } => *scroll_offset,
+            WidgetInstanceState::List { scroll_offset, .. } => *scroll_offset,
             _ => unreachable!(),
         };
         assert_eq!(scroll, 0);

@@ -3124,22 +3124,12 @@ impl Editor {
         buffer_id: BufferId,
         spec: fresh_core::api::WidgetSpec,
     ) {
-        // On re-mount of an already-known panel, preserve previous
-        // widget instance state (scroll offsets etc.) and focus key
-        // so plugins that re-mount on every reopen don't reset the
-        // user's position or focused control. First-time mount sees
-        // an empty prev state and an empty focus key (which the
-        // renderer interprets as "fall back to the first tabbable").
-        let prev = self
-            .widget_registry
-            .instance_states(panel_id)
-            .cloned()
-            .unwrap_or_default();
-        let prev_focus = self
-            .widget_registry
-            .focus_key(panel_id)
-            .map(|s| s.to_string())
-            .unwrap_or_default();
+        // Mount = clean slate. Instance state and focus key reset
+        // so a plugin that re-mounts (e.g. reopening a panel with
+        // a fresh prefill) sees its spec values take effect. To
+        // *preserve* state across renders, the plugin uses Update.
+        let prev = std::collections::HashMap::new();
+        let prev_focus = String::new();
         let out = crate::widgets::render_spec(&spec, &prev, &prev_focus);
         self.widget_registry.mount(
             panel_id,
@@ -3305,33 +3295,8 @@ impl Editor {
                 | Some(fresh_core::api::WidgetSpec::Toggle { .. }) => {
                     self.handle_widget_activate(panel_id);
                 }
-                Some(fresh_core::api::WidgetSpec::List {
-                    selected_index,
-                    item_keys,
-                    ..
-                }) => {
-                    let sel = *selected_index;
-                    if sel >= 0 {
-                        let item_key = item_keys
-                            .get(sel as usize)
-                            .cloned()
-                            .unwrap_or_default();
-                        let focus_key_clone = focus_key.clone();
-                        if self.plugin_manager.has_hook_handlers("widget_event") {
-                            self.plugin_manager.run_hook(
-                                "widget_event",
-                                fresh_core::hooks::HookArgs::WidgetEvent {
-                                    panel_id,
-                                    widget_key: focus_key_clone,
-                                    event_type: "activate".into(),
-                                    payload: serde_json::json!({
-                                        "index": sel,
-                                        "key": item_key,
-                                    }),
-                                },
-                            );
-                        }
-                    }
+                Some(fresh_core::api::WidgetSpec::List { .. }) => {
+                    self.fire_list_activate(panel_id, &focus_key);
                 }
                 _ => {}
             },
@@ -3343,33 +3308,8 @@ impl Editor {
                 Some(fresh_core::api::WidgetSpec::TextInput { .. }) => {
                     self.handle_widget_text_input_char(panel_id, " ");
                 }
-                Some(fresh_core::api::WidgetSpec::List {
-                    selected_index,
-                    item_keys,
-                    ..
-                }) => {
-                    let sel = *selected_index;
-                    if sel >= 0 {
-                        let item_key = item_keys
-                            .get(sel as usize)
-                            .cloned()
-                            .unwrap_or_default();
-                        let focus_key_clone = focus_key.clone();
-                        if self.plugin_manager.has_hook_handlers("widget_event") {
-                            self.plugin_manager.run_hook(
-                                "widget_event",
-                                fresh_core::hooks::HookArgs::WidgetEvent {
-                                    panel_id,
-                                    widget_key: focus_key_clone,
-                                    event_type: "activate".into(),
-                                    payload: serde_json::json!({
-                                        "index": sel,
-                                        "key": item_key,
-                                    }),
-                                },
-                            );
-                        }
-                    }
+                Some(fresh_core::api::WidgetSpec::List { .. }) => {
+                    self.fire_list_activate(panel_id, &focus_key);
                 }
                 _ => {}
             },
@@ -3433,11 +3373,58 @@ impl Editor {
         }
     }
 
+    /// Fire a `widget_event { event_type: "activate", payload: {
+    /// index, key } }` for the focused List, using its instance-state
+    /// selection (or spec selection on first render). The plugin's
+    /// activate handler does the actual user-visible thing — open
+    /// the matched file, expand/collapse a tree node, etc.
+    fn fire_list_activate(&mut self, panel_id: u64, focus_key: &str) {
+        let panel = match self.widget_registry.get(panel_id) {
+            Some(p) => p,
+            None => return,
+        };
+        let widget = crate::widgets::find_widget_by_key(&panel.spec, focus_key);
+        let (spec_sel, item_keys) = match widget {
+            Some(fresh_core::api::WidgetSpec::List {
+                selected_index,
+                item_keys,
+                ..
+            }) => (*selected_index, item_keys.clone()),
+            _ => return,
+        };
+        let sel = match panel.instance_states.get(focus_key) {
+            Some(crate::widgets::WidgetInstanceState::List {
+                selected_index, ..
+            }) => *selected_index,
+            _ => spec_sel,
+        };
+        if sel < 0 {
+            return;
+        }
+        let item_key = item_keys
+            .get(sel as usize)
+            .cloned()
+            .unwrap_or_default();
+        if self.plugin_manager.has_hook_handlers("widget_event") {
+            self.plugin_manager.run_hook(
+                "widget_event",
+                fresh_core::hooks::HookArgs::WidgetEvent {
+                    panel_id,
+                    widget_key: focus_key.to_string(),
+                    event_type: "activate".into(),
+                    payload: serde_json::json!({
+                        "index": sel,
+                        "key": item_key,
+                    }),
+                },
+            );
+        }
+    }
+
     fn handle_widget_select_move(&mut self, panel_id: u64, delta: i32) {
-        // Move the focused List's selection by `delta`. The widget
-        // owns scroll, so the visible window auto-tracks. Fires
-        // `widget_event { event_type: "select", payload: {index, key} }`
-        // so the plugin mirrors selection back into its model.
+        // Move the focused List's selection by `delta`. Selection
+        // and scroll live in instance state (host-owned) — read
+        // from there if present, fall back to spec on first render.
         let panel = match self.widget_registry.get(panel_id) {
             Some(p) => p,
             None => return,
@@ -3447,7 +3434,7 @@ impl Editor {
             return;
         }
         let widget = crate::widgets::find_widget_by_key(&panel.spec, &focus_key);
-        let (cur_sel, total, item_keys) = match widget {
+        let (spec_sel, total, item_keys) = match widget {
             Some(fresh_core::api::WidgetSpec::List {
                 selected_index,
                 items,
@@ -3459,12 +3446,39 @@ impl Editor {
         if total == 0 {
             return;
         }
+        // Prefer instance-state selected_index when present.
+        let cur_sel = match panel.instance_states.get(&focus_key) {
+            Some(crate::widgets::WidgetInstanceState::List {
+                selected_index, ..
+            }) => *selected_index,
+            _ => spec_sel,
+        };
         let raw = if cur_sel < 0 { 0 } else { cur_sel + delta };
         let new_sel = raw.clamp(0, total - 1);
         let new_key = item_keys
             .get(new_sel as usize)
             .cloned()
             .unwrap_or_default();
+        // Update instance state so subsequent reads (e.g. an Enter
+        // pressed before the plugin's spec update arrives) see the
+        // new selection.
+        if let Some(panel_mut) = self.widget_registry.get_mut(panel_id) {
+            let cur_scroll = match panel_mut.instance_states.get(&focus_key) {
+                Some(crate::widgets::WidgetInstanceState::List {
+                    scroll_offset, ..
+                }) => *scroll_offset,
+                _ => 0,
+            };
+            panel_mut.instance_states.insert(
+                focus_key.clone(),
+                crate::widgets::WidgetInstanceState::List {
+                    scroll_offset: cur_scroll,
+                    selected_index: new_sel,
+                },
+            );
+        }
+        // Re-render so the new selection's bg paints.
+        self.rerender_widget_panel(panel_id);
         if self.plugin_manager.has_hook_handlers("widget_event") {
             self.plugin_manager.run_hook(
                 "widget_event",
@@ -3478,42 +3492,76 @@ impl Editor {
         }
     }
 
-    fn handle_widget_text_input_key(&mut self, panel_id: u64, key: &str) {
-        // Apply a non-printable editing key to the focused TextInput.
-        // The host computes the new value/cursor (pure function of
-        // the spec's current value/cursor + the key) and fires
-        // `widget_event { event_type: "change" }`. The plugin
-        // updates its model and re-emits.
-        let panel = match self.widget_registry.get(panel_id) {
-            Some(p) => p,
-            None => return,
-        };
+    /// Read the focused TextInput's current value + cursor — from
+    /// instance state if present (the authoritative source once the
+    /// widget has rendered at least once), else from the spec
+    /// (initial-only fallback).
+    fn read_focused_text_input(
+        &self,
+        panel_id: u64,
+    ) -> Option<(String, String, usize)> {
+        let panel = self.widget_registry.get(panel_id)?;
         let focus_key = panel.focus_key.clone();
         if focus_key.is_empty() {
-            return;
+            return None;
         }
-        let widget = crate::widgets::find_widget_by_key(&panel.spec, &focus_key);
-        let (value, cursor_byte) = match widget {
-            Some(fresh_core::api::WidgetSpec::TextInput {
+        if let Some(crate::widgets::WidgetInstanceState::TextInput {
+            value,
+            cursor_byte,
+        }) = panel.instance_states.get(&focus_key)
+        {
+            return Some((focus_key, value.clone(), *cursor_byte as usize));
+        }
+        // Fall back to spec — only happens before the widget has
+        // ever rendered, which in practice should never be true at
+        // the time a WidgetCommand arrives.
+        let widget = crate::widgets::find_widget_by_key(&panel.spec, &focus_key)?;
+        match widget {
+            fresh_core::api::WidgetSpec::TextInput {
                 value, cursor_byte, ..
-            }) => (value.clone(), *cursor_byte),
-            _ => return,
-        };
-        let cur = if cursor_byte < 0 {
-            value.len()
-        } else {
-            (cursor_byte as usize).min(value.len())
-        };
-        let (new_value, new_cursor) = crate::widgets::apply_text_input_key(&value, cur, key);
-        if new_value == value && new_cursor == cur {
-            return; // no-op
+            } => {
+                let cur = if *cursor_byte < 0 {
+                    value.len()
+                } else {
+                    (*cursor_byte as usize).min(value.len())
+                };
+                Some((focus_key, value.clone(), cur))
+            }
+            _ => None,
         }
+    }
+
+    /// Write the focused TextInput's value + cursor into instance
+    /// state, then re-render the panel and fire a `change` event.
+    fn write_focused_text_input(
+        &mut self,
+        panel_id: u64,
+        focus_key: &str,
+        new_value: String,
+        new_cursor: usize,
+    ) {
+        // Update instance state directly so subsequent reads
+        // (including queued WidgetCommands behind this one) see the
+        // new value.
+        if let Some(panel) = self.widget_registry.get_mut(panel_id) {
+            panel.instance_states.insert(
+                focus_key.to_string(),
+                crate::widgets::WidgetInstanceState::TextInput {
+                    value: new_value.clone(),
+                    cursor_byte: new_cursor as u32,
+                },
+            );
+        }
+        // Re-render so the on-screen cursor + value reflect the
+        // mutation without waiting for the plugin to re-emit.
+        self.rerender_widget_panel(panel_id);
+        // Notify the plugin so its model can update too.
         if self.plugin_manager.has_hook_handlers("widget_event") {
             self.plugin_manager.run_hook(
                 "widget_event",
                 fresh_core::hooks::HookArgs::WidgetEvent {
                     panel_id,
-                    widget_key: focus_key,
+                    widget_key: focus_key.to_string(),
                     event_type: "change".into(),
                     payload: serde_json::json!({
                         "value": new_value,
@@ -3524,49 +3572,32 @@ impl Editor {
         }
     }
 
+    fn handle_widget_text_input_key(&mut self, panel_id: u64, key: &str) {
+        let (focus_key, value, cur) = match self.read_focused_text_input(panel_id) {
+            Some(t) => t,
+            None => return,
+        };
+        let (new_value, new_cursor) = crate::widgets::apply_text_input_key(&value, cur, key);
+        if new_value == value && new_cursor == cur {
+            return; // no-op
+        }
+        self.write_focused_text_input(panel_id, &focus_key, new_value, new_cursor);
+    }
+
     fn handle_widget_text_input_char(&mut self, panel_id: u64, text: &str) {
         if text.is_empty() {
             return;
         }
-        let panel = match self.widget_registry.get(panel_id) {
-            Some(p) => p,
+        let (focus_key, value, cur) = match self.read_focused_text_input(panel_id) {
+            Some(t) => t,
             None => return,
-        };
-        let focus_key = panel.focus_key.clone();
-        if focus_key.is_empty() {
-            return;
-        }
-        let widget = crate::widgets::find_widget_by_key(&panel.spec, &focus_key);
-        let (value, cursor_byte) = match widget {
-            Some(fresh_core::api::WidgetSpec::TextInput {
-                value, cursor_byte, ..
-            }) => (value.clone(), *cursor_byte),
-            _ => return,
-        };
-        let cur = if cursor_byte < 0 {
-            value.len()
-        } else {
-            (cursor_byte as usize).min(value.len())
         };
         let mut new_value = String::with_capacity(value.len() + text.len());
         new_value.push_str(&value[..cur]);
         new_value.push_str(text);
         new_value.push_str(&value[cur..]);
         let new_cursor = cur + text.len();
-        if self.plugin_manager.has_hook_handlers("widget_event") {
-            self.plugin_manager.run_hook(
-                "widget_event",
-                fresh_core::hooks::HookArgs::WidgetEvent {
-                    panel_id,
-                    widget_key: focus_key,
-                    event_type: "change".into(),
-                    payload: serde_json::json!({
-                        "value": new_value,
-                        "cursorByte": new_cursor as i64,
-                    }),
-                },
-            );
-        }
+        self.write_focused_text_input(panel_id, &focus_key, new_value, new_cursor);
     }
 
     fn handle_unmount_widget_panel(&mut self, panel_id: u64) {
