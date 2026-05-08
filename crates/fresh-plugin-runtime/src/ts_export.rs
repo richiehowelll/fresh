@@ -133,6 +133,7 @@ fn get_type_decl(type_name: &str) -> Option<String> {
         "WidgetSpec" => Some(fresh_core::api::WidgetSpec::decl(&cfg)),
         "HintEntry" => Some(fresh_core::api::HintEntry::decl(&cfg)),
         "ButtonKind" => Some(fresh_core::api::ButtonKind::decl(&cfg)),
+        "WidgetAction" => Some(fresh_core::api::WidgetAction::decl(&cfg)),
 
         // Authority — payload schema for `editor.setAuthority(...)`.
         // Hand-written because the authoritative struct lives in
@@ -252,6 +253,7 @@ const DEPENDENCY_TYPES: &[&str] = &[
     "HintEntry",                      // Used by WidgetSpec::HintBar
     "ButtonKind",                     // Used by WidgetSpec::Button.intent
     "WidgetSpec",                     // Used by mountWidgetPanel/updateWidgetPanel
+    "WidgetAction",                   // Used by widgetCommand
 ];
 
 /// Collect TypeScript type declarations based on referenced types from proc macro

@@ -42,6 +42,7 @@
 export type WidgetSpec = globalThis.WidgetSpec;
 export type HintEntry = globalThis.HintEntry;
 export type ButtonKind = globalThis.ButtonKind;
+export type WidgetAction = globalThis.WidgetAction;
 type TextPropertyEntry = globalThis.TextPropertyEntry;
 
 // =============================================================================
@@ -261,6 +262,66 @@ export class WidgetPanel {
     const editor = (globalThis as any).editor;
     return editor.unmountWidgetPanel(this.panelId);
   }
+
+  /** Route a key/nav action to the focused widget in this panel.
+   * The host computes the result on the focused widget's kind and
+   * fires `widget_event` as appropriate. See `WidgetAction` for
+   * the action shapes. */
+  command(action: WidgetAction): boolean {
+    // deno-lint-ignore no-explicit-any
+    const editor = (globalThis as any).editor;
+    return editor.widgetCommand(this.panelId, action);
+  }
+}
+
+// =============================================================================
+// WidgetAction builders — convenience wrappers around `panel.command(...)`.
+// Plugin's mode bindings call these for keys handled by the widget layer.
+// =============================================================================
+
+/** Cycle focus through the panel's tabbable widgets. `delta=+1`
+ * for Tab, `-1` for Shift+Tab. Wraps at the ends. */
+export function focusAdvance(delta: number): WidgetAction {
+  return { kind: "focusAdvance", delta };
+}
+
+/** Activate the focused widget (Enter on Button → "activate"
+ * event; Enter on Toggle → "toggle" event). No-op for other
+ * widget kinds. */
+export function activate(): WidgetAction {
+  return { kind: "activate" };
+}
+
+/** Move the focused List's selection by `delta`. Plugin listens
+ * for `widget_event` "select" to mirror back into its model. */
+export function selectMove(delta: number): WidgetAction {
+  return { kind: "selectMove", delta };
+}
+
+/** Apply a non-printable editing key to the focused TextInput:
+ * `"Backspace"`, `"Delete"`, `"Left"`, `"Right"`, `"Home"`,
+ * `"End"`. Fires `widget_event` "change" with the new value +
+ * cursorByte. */
+export function textInputKey(key: string): WidgetAction {
+  return { kind: "textInputKey", key };
+}
+
+/** Append printable text at the focused TextInput's cursor.
+ * Fires `widget_event` "change" with the new value + cursorByte.
+ * Used for the `mode_text_input` fall-through path. */
+export function textInputChar(text: string): WidgetAction {
+  return { kind: "textInputChar", text };
+}
+
+/** Smart-key dispatch — routes the keystroke to the right widget
+ * action based on the focused widget's kind. Plugin's mode bindings
+ * use this rather than picking the right action themselves: bind
+ * Tab/Shift+Tab/Enter/Space/Backspace/Delete/Left/Right/Up/Down/
+ * Home/End all to one handler that calls `panel.command(key("Tab"))`.
+ *
+ * See `WidgetAction::Key` (Rust) for the full dispatch table. */
+export function key(name: string): WidgetAction {
+  return { kind: "key", key: name };
 }
 
 // =============================================================================

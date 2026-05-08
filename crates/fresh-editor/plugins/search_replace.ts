@@ -3,13 +3,16 @@ import {
   button,
   col,
   hintBar,
+  key as widgetKey,
   list,
   parseHintString,
   raw,
   row,
   spacer,
   textInput,
+  textInputChar,
   toggle,
+  type WidgetAction,
   WidgetPanel,
   type WidgetSpec,
 } from "./lib/widgets.ts";
@@ -213,21 +216,14 @@ const modeBindings: [string, string][] = [
 
 editor.defineMode("search-replace-list", modeBindings, true, true);
 
-// Single handler for all character input (any keyboard layout, including Unicode)
-function insertCharAtCursor(ch: string): void {
-  if (!panel || panel.focusPanel !== "query") return;
-  const text = getActiveFieldText();
-  const pos = panel.cursorPos;
-  setActiveFieldText(text.slice(0, pos) + ch + text.slice(pos));
-  panel.cursorPos = pos + ch.length;
-  updatePanelContent();
-}
-
-// Handler for mode_text_input events dispatched by the mode system
+// Printable input flows through the widget runtime: mode_text_input
+// → widgetCommand(textInputChar(text)) → host computes new value +
+// cursor on the focused TextInput → widget_event "change" → plugin
+// updates its model from the event payload (see the widget_event
+// handler at the bottom of the file).
 function mode_text_input(args: { text: string }): void {
-  if (args && args.text) {
-    insertCharAtCursor(args.text);
-  }
+  if (!panel || !args?.text) return;
+  panel.widgetPanel?.command(textInputChar(args.text));
 }
 registerHandler("mode_text_input", mode_text_input);
 
@@ -1012,176 +1008,40 @@ async function rerunSearchQuiet(): Promise<void> {
 // Text editing handlers (inline editing of query fields)
 // =============================================================================
 
-function search_replace_backspace(): void {
-  if (!panel || panel.focusPanel !== "query") return;
-  const text = getActiveFieldText();
-  const pos = panel.cursorPos;
-  if (pos <= 0) return;
-  setActiveFieldText(text.slice(0, pos - 1) + text.slice(pos));
-  panel.cursorPos = pos - 1;
-  updatePanelContent();
+// All editing / navigation keys route through the widget runtime
+// via the smart `Key` dispatch — the host knows which widget is
+// focused and routes accordingly (Backspace into TextInput; Up/Down
+// across List rows; Enter/Space activate Toggle/Button/List;
+// printable Space inserts into TextInput; Tab/Shift+Tab cycles
+// focus). See WidgetAction::Key for the full table.
+function dispatch(action: WidgetAction): void {
+  panel?.widgetPanel?.command(action);
 }
-registerHandler("search_replace_backspace", search_replace_backspace);
 
-function search_replace_delete(): void {
-  if (!panel || panel.focusPanel !== "query") return;
-  const text = getActiveFieldText();
-  const pos = panel.cursorPos;
-  if (pos >= text.length) return;
-  setActiveFieldText(text.slice(0, pos) + text.slice(pos + 1));
-  updatePanelContent();
-}
-registerHandler("search_replace_delete", search_replace_delete);
+registerHandler("search_replace_backspace", () => dispatch(widgetKey("Backspace")));
+registerHandler("search_replace_delete",    () => dispatch(widgetKey("Delete")));
+registerHandler("search_replace_home",      () => dispatch(widgetKey("Home")));
+registerHandler("search_replace_end",       () => dispatch(widgetKey("End")));
+registerHandler("search_replace_nav_left",  () => dispatch(widgetKey("Left")));
+registerHandler("search_replace_nav_right", () => dispatch(widgetKey("Right")));
+registerHandler("search_replace_nav_up",    () => dispatch(widgetKey("Up")));
+registerHandler("search_replace_nav_down",  () => dispatch(widgetKey("Down")));
 
-function search_replace_home(): void {
-  if (!panel || panel.focusPanel !== "query") return;
-  panel.cursorPos = 0;
-  updatePanelContent();
-}
-registerHandler("search_replace_home", search_replace_home);
+// Tab / Shift+Tab now cycle focus through the host's tabbable
+// widget set (declared in spec via `key`s — searchField,
+// replaceField, case, regex, whole, replaceAll, matchList).
+// The host re-renders with focus styling on the new widget; the
+// plugin needn't track focusPanel/queryField/optionIndex anymore
+// (the legacy fields linger in PanelState until the rest of the
+// plugin migrates off them).
+registerHandler("search_replace_tab",       () => dispatch(widgetKey("Tab")));
+registerHandler("search_replace_shift_tab", () => dispatch(widgetKey("Shift+Tab")));
 
-function search_replace_end(): void {
-  if (!panel || panel.focusPanel !== "query") return;
-  panel.cursorPos = getActiveFieldText().length;
-  updatePanelContent();
-}
-registerHandler("search_replace_end", search_replace_end);
-
-// =============================================================================
-// Navigation handlers
-// =============================================================================
-
-function search_replace_nav_down(): void {
-  if (!panel) return;
-  if (panel.focusPanel === "query") {
-    if (panel.queryField === "search") {
-      panel.queryField = "replace";
-      panel.cursorPos = panel.replaceText.length;
-    }
-    updatePanelContent();
-  } else if (panel.focusPanel === "options") {
-    if (panel.optionIndex < 3) { panel.optionIndex++; updatePanelContent(); }
-  } else {
-    const flat = buildFlatItems();
-    if (panel.matchIndex < flat.length - 1) { panel.matchIndex++; updatePanelContent(); }
-  }
-}
-registerHandler("search_replace_nav_down", search_replace_nav_down);
-
-function search_replace_nav_up(): void {
-  if (!panel) return;
-  if (panel.focusPanel === "query") {
-    if (panel.queryField === "replace") {
-      panel.queryField = "search";
-      panel.cursorPos = panel.searchPattern.length;
-    }
-    updatePanelContent();
-  } else if (panel.focusPanel === "options") {
-    if (panel.optionIndex > 0) { panel.optionIndex--; updatePanelContent(); }
-  } else {
-    if (panel.matchIndex > 0) { panel.matchIndex--; updatePanelContent(); }
-  }
-}
-registerHandler("search_replace_nav_up", search_replace_nav_up);
-
-function search_replace_tab(): void {
-  editor.debug("search_replace_tab CALLED, panel=" + (panel ? "yes" : "null"));
-  if (!panel) return;
-  if (panel.focusPanel === "query") {
-    if (panel.queryField === "search") {
-      // Search → Replace
-      panel.queryField = "replace";
-      panel.cursorPos = panel.replaceText.length;
-      updatePanelContent();
-      return;
-    } else {
-      // Replace → Options
-      panel.focusPanel = "options";
-    }
-  } else if (panel.focusPanel === "options") {
-    panel.focusPanel = "matches";
-  } else {
-    // Matches → Query/Search
-    panel.focusPanel = "query";
-    panel.queryField = "search";
-    panel.cursorPos = panel.searchPattern.length;
-  }
-  updatePanelContent();
-}
-registerHandler("search_replace_tab", search_replace_tab);
-
-function search_replace_shift_tab(): void {
-  if (!panel) return;
-  if (panel.focusPanel === "matches") {
-    panel.focusPanel = "options";
-  } else if (panel.focusPanel === "options") {
-    panel.focusPanel = "query";
-    panel.queryField = "replace";
-    panel.cursorPos = panel.replaceText.length;
-  } else {
-    if (panel.queryField === "replace") {
-      panel.queryField = "search";
-      panel.cursorPos = panel.searchPattern.length;
-    } else {
-      panel.focusPanel = "matches";
-    }
-  }
-  updatePanelContent();
-}
-registerHandler("search_replace_shift_tab", search_replace_shift_tab);
-
-function search_replace_nav_left(): void {
-  if (!panel) return;
-  // When in query panel, move cursor left
-  if (panel.focusPanel === "query") {
-    if (panel.cursorPos > 0) {
-      panel.cursorPos--;
-      updatePanelContent();
-    }
-    return;
-  }
-  if (panel.focusPanel !== "matches") return;
-  const flat = buildFlatItems();
-  const item = flat[panel.matchIndex];
-  if (!item) return;
-  if (item.type === "file") {
-    if (panel.fileGroups[item.fileIndex].expanded) {
-      panel.fileGroups[item.fileIndex].expanded = false;
-      updatePanelContent();
-    }
-  } else {
-    for (let i = panel.matchIndex - 1; i >= 0; i--) {
-      if (flat[i].type === "file" && flat[i].fileIndex === item.fileIndex) {
-        panel.matchIndex = i;
-        updatePanelContent();
-        break;
-      }
-    }
-  }
-}
-registerHandler("search_replace_nav_left", search_replace_nav_left);
-
-function search_replace_nav_right(): void {
-  if (!panel) return;
-  // When in query panel, move cursor right
-  if (panel.focusPanel === "query") {
-    const text = getActiveFieldText();
-    if (panel.cursorPos < text.length) {
-      panel.cursorPos++;
-      updatePanelContent();
-    }
-    return;
-  }
-  if (panel.focusPanel !== "matches") return;
-  const flat = buildFlatItems();
-  const item = flat[panel.matchIndex];
-  if (!item) return;
-  if (item.type === "file" && !panel.fileGroups[item.fileIndex].expanded) {
-    panel.fileGroups[item.fileIndex].expanded = true;
-    updatePanelContent();
-  }
-}
-registerHandler("search_replace_nav_right", search_replace_nav_right);
+// Legacy nav_left / nav_right (which doubled as Tree expand/collapse
+// when focused on the matchList) is gone — Left/Right now route via
+// the widget runtime as TextInput cursor moves. File-row expand/
+// collapse is a Tree-widget feature; List doesn't have it in v1.
+// Track this regression in the migration plan.
 
 // Global option toggles (Alt+C, Alt+R, Alt+W)
 function search_replace_toggle_case(): void {
@@ -1222,81 +1082,19 @@ registerHandler("search_replace_replace_scoped", search_replace_replace_scoped);
 // Action handlers
 // =============================================================================
 
-function search_replace_enter(): void {
-  editor.debug("search_replace_enter CALLED, panel=" + (panel ? "yes" : "null"));
-  if (!panel) return;
-  if (panel.focusPanel === "query") {
-    // Enter in query field = confirm and run search
-    if (panel.queryField === "search") {
-      // Move to replace field
-      panel.queryField = "replace";
-      panel.cursorPos = panel.replaceText.length;
-      updatePanelContent();
-    } else {
-      // Confirm replace field and run search
-      if (panel.searchPattern) {
-        rerunSearch().then(() => {
-          if (panel) {
-            panel.focusPanel = "matches";
-            panel.matchIndex = 0;
-            panel.scrollOffset = 0;
-            updatePanelContent();
-          }
-        });
-      }
-    }
-  } else if (panel.focusPanel === "options") {
-    if (panel.optionIndex === 3) {
-      doReplaceAll();
-    } else {
-      search_replace_space();
-    }
-  } else {
-    const flat = buildFlatItems();
-    const item = flat[panel.matchIndex];
-    if (!item) return;
-    if (item.type === "file") {
-      panel.fileGroups[item.fileIndex].expanded = !panel.fileGroups[item.fileIndex].expanded;
-      updatePanelContent();
-    } else {
-      const group = panel.fileGroups[item.fileIndex];
-      const result = group.matches[item.matchIndex!];
-      editor.openFileInSplit(panel.sourceSplitId, result.match.file, result.match.line, result.match.column);
-    }
-  }
-}
-registerHandler("search_replace_enter", search_replace_enter);
-
-function search_replace_space(): void {
-  if (!panel) return;
-  if (panel.focusPanel === "query") {
-    // Space in query field = insert space character
-    insertCharAtCursor(" ");
-    return;
-  }
-  if (panel.focusPanel === "options") {
-    if (panel.optionIndex === 0) { panel.caseSensitive = !panel.caseSensitive; updatePanelContent(); rerunSearchDebounced(); }
-    else if (panel.optionIndex === 1) { panel.useRegex = !panel.useRegex; updatePanelContent(); rerunSearchDebounced(); }
-    else if (panel.optionIndex === 2) { panel.wholeWords = !panel.wholeWords; updatePanelContent(); rerunSearchDebounced(); }
-    else if (panel.optionIndex === 3) { doReplaceAll(); }
-    return;
-  }
-  if (panel.focusPanel === "matches") {
-    const flat = buildFlatItems();
-    const item = flat[panel.matchIndex];
-    if (!item) return;
-    if (item.type === "file") {
-      const group = panel.fileGroups[item.fileIndex];
-      const allSelected = group.matches.every(m => m.selected);
-      for (const m of group.matches) m.selected = !allSelected;
-    } else {
-      const group = panel.fileGroups[item.fileIndex];
-      group.matches[item.matchIndex!].selected = !group.matches[item.matchIndex!].selected;
-    }
-    updatePanelContent();
-  }
-}
-registerHandler("search_replace_space", search_replace_space);
+// Enter / Space route to the widget runtime. The host decides what
+// each does based on the focused widget kind:
+//   * Toggle (case/regex/whole) → fires `widget_event` "toggle".
+//   * Button (replaceAll)       → fires `widget_event` "activate".
+//   * List   (matchList)        → fires `widget_event` "activate"
+//                                  with the focused row's index/key.
+//   * TextInput + Space         → inserts " " (fires "change").
+//   * TextInput + Enter         → no-op (plugin can still bind a
+//                                  separate handler if it wants
+//                                  Enter to mean "submit").
+// Per-event handling lives in the `widget_event` listener below.
+registerHandler("search_replace_enter", () => dispatch(widgetKey("Enter")));
+registerHandler("search_replace_space", () => dispatch(widgetKey("Space")));
 
 async function doReplaceAll(): Promise<void> {
   if (!panel || panel.busy) return;
@@ -1451,51 +1249,116 @@ editor.on("buffer_closed", (args) => {
 // the state change.
 editor.on("widget_event", (args) => {
   if (!panel || args.panel_id !== panel.widgetPanel?.id()) return;
-  // List `select` events fire when the user clicks on a match list
-  // row. The payload's `index` is the absolute index into the
-  // (now widget-owned) flat-item dataset; mirror it into
-  // `panel.matchIndex` so the existing keyboard-nav code (which
-  // reads matchIndex) stays consistent. The List widget handles
-  // scroll auto-clamping for us — the next render keeps the
-  // newly-selected item visible without plugin involvement.
+
+  // `change` — fired for TextInput edits (Backspace, Delete,
+  // arrows, Home/End, mode_text_input). Payload carries the new
+  // value and cursor byte offset. Plugin updates its model from
+  // these and re-emits the spec.
+  if (args.event_type === "change") {
+    const payload = args.payload as
+      | { value?: string; cursorByte?: number }
+      | undefined;
+    if (typeof payload?.value !== "string") return;
+    const cursorByte = typeof payload.cursorByte === "number"
+      ? payload.cursorByte
+      : payload.value.length;
+    if (args.widget_key === "searchField") {
+      panel.searchPattern = payload.value;
+      panel.cursorPos = byteToCharOffset(payload.value, cursorByte);
+      updatePanelContent();
+      rerunSearchDebounced();
+    } else if (args.widget_key === "replaceField") {
+      panel.replaceText = payload.value;
+      panel.cursorPos = byteToCharOffset(payload.value, cursorByte);
+      updatePanelContent();
+    }
+    return;
+  }
+
+  // `select` — fired when the user clicks a List row or the host
+  // moves selection (Up/Down). Mirror the absolute index into
+  // panel.matchIndex.
   if (args.event_type === "select") {
     const idx = (args.payload as { index?: number } | undefined)?.index;
     if (typeof idx === "number") {
-      panel.focusPanel = "matches";
       panel.matchIndex = idx;
       updatePanelContent();
     }
     return;
   }
-  switch (args.widget_key) {
-    case "case":
-      panel.focusPanel = "options";
-      panel.optionIndex = 0;
-      panel.caseSensitive = !panel.caseSensitive;
-      updatePanelContent();
-      rerunSearchDebounced();
-      break;
-    case "regex":
-      panel.focusPanel = "options";
-      panel.optionIndex = 1;
-      panel.useRegex = !panel.useRegex;
-      updatePanelContent();
-      rerunSearchDebounced();
-      break;
-    case "whole":
-      panel.focusPanel = "options";
-      panel.optionIndex = 2;
-      panel.wholeWords = !panel.wholeWords;
-      updatePanelContent();
-      rerunSearchDebounced();
-      break;
-    case "replaceAll":
-      panel.focusPanel = "options";
-      panel.optionIndex = 3;
+
+  // `activate` — fired by Enter/Space on a focused Button or List.
+  // For the Replace All button: run replace. For the matchList:
+  // open the focused match's source location (file rows toggle
+  // their expanded state in the model — Tree-widget territory).
+  if (args.event_type === "activate") {
+    if (args.widget_key === "replaceAll") {
       doReplaceAll();
-      break;
+      return;
+    }
+    if (args.widget_key === "matchList") {
+      const idx = (args.payload as { index?: number } | undefined)?.index;
+      if (typeof idx !== "number") return;
+      const flat = buildFlatItems();
+      const item = flat[idx];
+      if (!item) return;
+      if (item.type === "file") {
+        panel.fileGroups[item.fileIndex].expanded =
+          !panel.fileGroups[item.fileIndex].expanded;
+        updatePanelContent();
+      } else {
+        const group = panel.fileGroups[item.fileIndex];
+        const result = group.matches[item.matchIndex!];
+        editor.openFileInSplit(
+          panel.sourceSplitId,
+          result.match.file,
+          result.match.line,
+          result.match.column,
+        );
+      }
+      return;
+    }
+  }
+
+  // `toggle` — fired by Enter/Space on a Toggle (case/regex/whole)
+  // and by mouse click. Payload has the new `checked` value.
+  if (args.event_type === "toggle") {
+    const newChecked = (args.payload as { checked?: boolean } | undefined)
+      ?.checked;
+    if (typeof newChecked !== "boolean") return;
+    switch (args.widget_key) {
+      case "case":
+        panel.caseSensitive = newChecked;
+        updatePanelContent();
+        rerunSearchDebounced();
+        break;
+      case "regex":
+        panel.useRegex = newChecked;
+        updatePanelContent();
+        rerunSearchDebounced();
+        break;
+      case "whole":
+        panel.wholeWords = newChecked;
+        updatePanelContent();
+        rerunSearchDebounced();
+        break;
+    }
   }
 });
+
+// Convert a UTF-8 byte offset into a JS-string character offset,
+// because the host's TextInput cursor model uses bytes (matching the
+// inline-overlay coordinate space) but the plugin's existing code
+// stores `panel.cursorPos` as a char offset. Pure walk over the
+// string until we hit `byteOffset`.
+function byteToCharOffset(value: string, byteOffset: number): number {
+  let bytes = 0;
+  for (let i = 0; i < value.length; i++) {
+    if (bytes >= byteOffset) return i;
+    bytes += byteLen(value[i]);
+  }
+  return value.length;
+}
 
 editor.registerCommand(
   "%cmd.search_replace",

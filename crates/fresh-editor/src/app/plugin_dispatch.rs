@@ -3214,7 +3214,7 @@ impl Editor {
     /// re-emitting the spec. Reads the panel's current spec from
     /// the registry, runs `render_spec` against the (possibly
     /// updated) prev state / focus key, writes the result back.
-    fn rerender_widget_panel(&mut self, panel_id: u64) {
+    pub(super) fn rerender_widget_panel(&mut self, panel_id: u64) {
         let (buffer_id, spec) = match self.widget_registry.buffer_and_spec(panel_id) {
             Some(s) => s,
             None => return,
@@ -3265,6 +3265,115 @@ impl Editor {
             WidgetAction::TextInputChar { text } => {
                 self.handle_widget_text_input_char(panel_id, &text);
             }
+            WidgetAction::Key { key } => {
+                self.handle_widget_key(panel_id, &key);
+            }
+        }
+    }
+
+    fn handle_widget_key(&mut self, panel_id: u64, key: &str) {
+        // Smart key dispatch — route to the right specialized
+        // handler based on focused widget kind. See WidgetAction::Key
+        // doc for the dispatch table.
+        let panel = match self.widget_registry.get(panel_id) {
+            Some(p) => p,
+            None => return,
+        };
+        let focus_key = panel.focus_key.clone();
+        let widget = if focus_key.is_empty() {
+            None
+        } else {
+            crate::widgets::find_widget_by_key(&panel.spec, &focus_key)
+        };
+        match key {
+            "Tab" => self.handle_widget_focus_advance(panel_id, 1),
+            "Shift+Tab" => self.handle_widget_focus_advance(panel_id, -1),
+            "Up" | "Down" => match widget {
+                Some(fresh_core::api::WidgetSpec::List { .. }) => {
+                    let delta = if key == "Up" { -1 } else { 1 };
+                    self.handle_widget_select_move(panel_id, delta);
+                }
+                _ => {}
+            },
+            "Backspace" | "Delete" | "Left" | "Right" | "Home" | "End" => {
+                if matches!(widget, Some(fresh_core::api::WidgetSpec::TextInput { .. })) {
+                    self.handle_widget_text_input_key(panel_id, key);
+                }
+            }
+            "Enter" => match widget {
+                Some(fresh_core::api::WidgetSpec::Button { .. })
+                | Some(fresh_core::api::WidgetSpec::Toggle { .. }) => {
+                    self.handle_widget_activate(panel_id);
+                }
+                Some(fresh_core::api::WidgetSpec::List {
+                    selected_index,
+                    item_keys,
+                    ..
+                }) => {
+                    let sel = *selected_index;
+                    if sel >= 0 {
+                        let item_key = item_keys
+                            .get(sel as usize)
+                            .cloned()
+                            .unwrap_or_default();
+                        let focus_key_clone = focus_key.clone();
+                        if self.plugin_manager.has_hook_handlers("widget_event") {
+                            self.plugin_manager.run_hook(
+                                "widget_event",
+                                fresh_core::hooks::HookArgs::WidgetEvent {
+                                    panel_id,
+                                    widget_key: focus_key_clone,
+                                    event_type: "activate".into(),
+                                    payload: serde_json::json!({
+                                        "index": sel,
+                                        "key": item_key,
+                                    }),
+                                },
+                            );
+                        }
+                    }
+                }
+                _ => {}
+            },
+            "Space" => match widget {
+                Some(fresh_core::api::WidgetSpec::Button { .. })
+                | Some(fresh_core::api::WidgetSpec::Toggle { .. }) => {
+                    self.handle_widget_activate(panel_id);
+                }
+                Some(fresh_core::api::WidgetSpec::TextInput { .. }) => {
+                    self.handle_widget_text_input_char(panel_id, " ");
+                }
+                Some(fresh_core::api::WidgetSpec::List {
+                    selected_index,
+                    item_keys,
+                    ..
+                }) => {
+                    let sel = *selected_index;
+                    if sel >= 0 {
+                        let item_key = item_keys
+                            .get(sel as usize)
+                            .cloned()
+                            .unwrap_or_default();
+                        let focus_key_clone = focus_key.clone();
+                        if self.plugin_manager.has_hook_handlers("widget_event") {
+                            self.plugin_manager.run_hook(
+                                "widget_event",
+                                fresh_core::hooks::HookArgs::WidgetEvent {
+                                    panel_id,
+                                    widget_key: focus_key_clone,
+                                    event_type: "activate".into(),
+                                    payload: serde_json::json!({
+                                        "index": sel,
+                                        "key": item_key,
+                                    }),
+                                },
+                            );
+                        }
+                    }
+                }
+                _ => {}
+            },
+            _ => {} // unrecognised key — quietly ignore
         }
     }
 

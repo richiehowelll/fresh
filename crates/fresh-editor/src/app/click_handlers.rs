@@ -273,6 +273,22 @@ impl Editor {
             if let Some((panel_id, hit)) =
                 self.widget_registry.hit_test(buffer_id, brow, bcol)
             {
+                // Click-to-focus: if the clicked widget has a stable
+                // key that's tabbable, move focus there before
+                // firing the event. The next render shows the focus
+                // moved; subsequent Tab cycling starts from the
+                // clicked widget.
+                if !hit.widget_key.is_empty() {
+                    if let Some(panel) = self.widget_registry.get(panel_id) {
+                        if panel.tabbable.iter().any(|k| k == &hit.widget_key) {
+                            self.widget_registry
+                                .set_focus_key(panel_id, hit.widget_key.clone());
+                        }
+                    }
+                    // Re-render so the focus styling updates without
+                    // waiting for the plugin to re-emit the spec.
+                    self.rerender_widget_panel(panel_id);
+                }
                 if self.plugin_manager.has_hook_handlers("widget_event") {
                     self.plugin_manager.run_hook(
                         "widget_event",

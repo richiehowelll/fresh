@@ -1375,6 +1375,31 @@ pub enum WidgetAction {
     /// current cursor position. Used for the `mode_text_input`
     /// fall-through path. Fires `widget_event` as for `TextInputKey`.
     TextInputChar { text: String },
+    /// "Smart" keystroke dispatch — the host routes based on the
+    /// focused widget's kind without the plugin needing to know
+    /// what's focused. This is the recommended path for plugin
+    /// mode bindings: bind every relevant key to one handler that
+    /// calls `editor.widgetCommand(panel_id, key("Tab"))` etc.
+    ///
+    /// Dispatch table:
+    ///
+    /// | Key                                   | TextInput   | Toggle / Button | List       | (no focus) |
+    /// |---------------------------------------|-------------|-----------------|------------|------------|
+    /// | `Tab`                                 | focus +1    | focus +1        | focus +1   | no-op      |
+    /// | `Shift+Tab`                           | focus -1    | focus -1        | focus -1   | no-op      |
+    /// | `Backspace` / `Delete` / `Left` / `Right` / `Home` / `End` | text-edit | no-op | no-op | no-op |
+    /// | `Up`                                  | no-op       | no-op           | select -1  | no-op      |
+    /// | `Down`                                | no-op       | no-op           | select +1  | no-op      |
+    /// | `Enter`                               | no-op       | activate        | activate   | no-op      |
+    /// | `Space`                               | char " "    | activate        | activate   | no-op      |
+    /// | (anything else)                       | no-op       | no-op           | no-op      | no-op      |
+    ///
+    /// "no-op" still returns successfully — plugins can rely on the
+    /// command not erroring when the focused widget can't handle the
+    /// key. Plugins that want to fall back to their own behaviour
+    /// when the widget doesn't claim a key should bind those keys
+    /// to plugin-specific handlers instead.
+    Key { key: String },
 }
 
 /// Plugin command - allows plugins to send commands to the editor

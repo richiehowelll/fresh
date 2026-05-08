@@ -4372,6 +4372,38 @@ impl JsEditorApi {
             .is_ok()
     }
 
+    /// Route a keystroke / nav action to the panel's focused widget.
+    ///
+    /// `action` is a `WidgetAction` JSON object — see fresh.d.ts for
+    /// the shapes (`{kind: "focusAdvance", delta: 1}` etc.). Plugin's
+    /// `defineMode` bindings dispatch into here for keys handled by
+    /// the widget layer; the host runtime acts on the panel's
+    /// currently focused widget and fires `widget_event` as
+    /// appropriate.
+    #[qjs(rename = "widgetCommand")]
+    pub fn widget_command<'js>(
+        &self,
+        ctx: rquickjs::Ctx<'js>,
+        panel_id: f64,
+        action_obj: rquickjs::Value<'js>,
+    ) -> rquickjs::Result<bool> {
+        let json = js_to_json(&ctx, action_obj);
+        let action: fresh_core::api::WidgetAction = match serde_json::from_value(json) {
+            Ok(a) => a,
+            Err(e) => {
+                tracing::error!("widgetCommand: invalid action: {}", e);
+                return Ok(false);
+            }
+        };
+        Ok(self
+            .command_sender
+            .send(PluginCommand::WidgetCommand {
+                panel_id: panel_id as u64,
+                action,
+            })
+            .is_ok())
+    }
+
     // === Async Operations ===
 
     /// Spawn a process (async, returns request_id)

@@ -47,20 +47,27 @@ export type {
 
 // Widget library — declarative plugin UI (see widgets.ts).
 export {
+  activate,
   button,
   col,
+  focusAdvance,
   hintBar,
+  key,
   list,
   parseHintString,
   raw,
   row,
+  selectMove,
   spacer,
   textInput,
+  textInputChar,
+  textInputKey,
   toggle,
   WidgetPanel,
 } from "./widgets.ts";
 export type {
   ButtonKind,
   HintEntry as WidgetHintEntry,
+  WidgetAction,
   WidgetSpec,
 } from "./widgets.ts";

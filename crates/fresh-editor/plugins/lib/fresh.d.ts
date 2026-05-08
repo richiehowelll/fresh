@@ -771,6 +771,24 @@ type WidgetSpec = {
 	entries: Array<TextPropertyEntry>;
 	key?: string | null;
 };
+type WidgetAction = {
+	"kind": "focusAdvance";
+	delta: number;
+} | {
+	"kind": "activate";
+} | {
+	"kind": "selectMove";
+	delta: number;
+} | {
+	"kind": "textInputKey";
+	key: string;
+} | {
+	"kind": "textInputChar";
+	text: string;
+} | {
+	"kind": "key";
+	key: string;
+};
 type AuthorityFilesystem = {
 	kind: "local";
 };
@@ -2044,6 +2062,17 @@ interface EditorAPI {
 	* ownership of the underlying virtual buffer.
 	*/
 	unmountWidgetPanel(panelId: number): boolean;
+	/**
+	* Route a keystroke / nav action to the panel's focused widget.
+	* 
+	* `action` is a `WidgetAction` JSON object — see fresh.d.ts for
+	* the shapes (`{kind: "focusAdvance", delta: 1}` etc.). Plugin's
+	* `defineMode` bindings dispatch into here for keys handled by
+	* the widget layer; the host runtime acts on the panel's
+	* currently focused widget and fires `widget_event` as
+	* appropriate.
+	*/
+	widgetCommand(panelId: number, actionObj: unknown): boolean;
 	/**
 	* Spawn a process (async, returns request_id)
 	*/
