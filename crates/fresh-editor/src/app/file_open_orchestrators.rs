@@ -298,8 +298,7 @@ impl Editor {
             self.active_buffer()
         } else {
             // Create new buffer for this file
-            let id = BufferId(self.next_buffer_id);
-            self.next_buffer_id += 1;
+            let id = self.alloc_buffer_id();
             id
         };
 
@@ -528,8 +527,7 @@ impl Editor {
         }
 
         // Create new buffer
-        let buffer_id = BufferId(self.next_buffer_id);
-        self.next_buffer_id += 1;
+        let buffer_id = self.alloc_buffer_id();
 
         // Load from canonical path (for I/O and dedup), detect language from
         // display path (for glob pattern matching against user-visible names).
@@ -653,8 +651,7 @@ impl Editor {
         }
 
         // Create new buffer with specified encoding
-        let buffer_id = BufferId(self.next_buffer_id);
-        self.next_buffer_id += 1;
+        let buffer_id = self.alloc_buffer_id();
 
         // Load buffer with the specified encoding (use canonical path for I/O)
         let buffer = crate::model::buffer::Buffer::load_from_file_with_encoding(
@@ -843,8 +840,7 @@ impl Editor {
         }
 
         // Create new buffer with forced full loading
-        let buffer_id = BufferId(self.next_buffer_id);
-        self.next_buffer_id += 1;
+        let buffer_id = self.alloc_buffer_id();
 
         // Load buffer with forced full loading (bypasses the large file encoding check)
         let buffer = crate::model::buffer::Buffer::load_large_file_confirmed(
@@ -1199,8 +1195,7 @@ impl Editor {
             .margins
             .configure_for_line_numbers(self.config.editor.line_numbers);
 
-        let buffer_id = BufferId(self.next_buffer_id);
-        self.next_buffer_id += 1;
+        let buffer_id = self.alloc_buffer_id();
         self.windows
             .get_mut(&self.active_window)
             .map(|w| &mut w.buffers)
