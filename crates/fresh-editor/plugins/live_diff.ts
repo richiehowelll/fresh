@@ -73,19 +73,22 @@ const DEBOUNCE_MS = 75;
 
 // Skip virtual-line rendering when either side is huge — line-by-line
 // LCS would be too slow. Gutter glyphs still render via a degraded path.
-const MAX_DIFF_LINES = 20_000;
-// Soft cap on the LCS DP table; past this we stop computing virtual lines.
-const MAX_DP_CELLS = 4_000_000;
+// In practice the DP only runs over the diff's *middle* (common prefix
+// and suffix are stripped first), so this cap rarely bites for typical
+// "small edit to a large file" cases.
+const MAX_DIFF_LINES = 100_000;
+// Soft cap on the LCS DP table; past this we stop computing virtual
+// lines. Applies to the post-prefix/suffix-stripped middle, not the
+// whole file.
+const MAX_DP_CELLS = 16_000_000;
 
 // Similarity (Sørensen–Dice over character LCS) above which a 1:1
 // modified pair is rendered as "modified" (bg-only highlight on the
 // new line, no deletion virtual line). Below this we split the pair
 // into a `removed` (virtual deletion line) + `added` (bg-highlighted)
 // hunk pair so the change reads as a rewrite, not an in-place edit.
-//
-// 0.5 matches `difflib.SequenceMatcher.ratio()`-style heuristics used
-// by VS Code, IntelliJ and most diff viewers.
-const SIMILARITY_THRESHOLD = 0.5;
+// Tunable at runtime via `editor.getPluginApi("live-diff").setSimilarityThreshold(x)`.
+let similarityThreshold = 0.95;
 // Bail out of char-LCS on huge lines; cost is O(m * n).
 const MAX_LINE_LCS_CHARS = 2000;
 // Bail out of word-LCS when either side has more tokens than this;
@@ -661,7 +664,7 @@ function refineHunks(hunks: Hunk[], newLines: string[]): Hunk[] {
       const oldLine = h.oldLines[i];
       const newLine = newLines[h.newStart + i] ?? "";
       const sim = lineSimilarity(oldLine, newLine);
-      if (sim >= SIMILARITY_THRESHOLD) {
+      if (sim >= similarityThreshold) {
         const ranges = computeWordDiff(oldLine, newLine);
         out.push({
           kind: "modified",
@@ -1225,6 +1228,42 @@ editor.registerCommand("%cmd.vs_branch", "%cmd.vs_branch_desc", "live_diff_vs_br
 editor.registerCommand("%cmd.vs_default_branch", "%cmd.vs_default_branch_desc", "live_diff_vs_default_branch", null);
 editor.registerCommand("%cmd.refresh", "%cmd.refresh_desc", "live_diff_refresh", null);
 editor.registerCommand("%cmd.set_default", "%cmd.set_default_desc", "live_diff_set_default", null);
+
+// =============================================================================
+// Plugin API
+// =============================================================================
+
+export type LiveDiffApi = {
+  /** Lines whose Sørensen–Dice similarity ratio is at least this value
+   * render as in-place "modified" (bg highlight + word-level diff on the
+   * new line). Below this they split into a removed + added pair so the
+   * change reads as a rewrite. Range 0..1; clamped. */
+  setSimilarityThreshold(value: number): void;
+  getSimilarityThreshold(): number;
+};
+
+declare global {
+  interface FreshPluginRegistry {
+    "live-diff": LiveDiffApi;
+  }
+}
+
+editor.exportPluginApi("live-diff", {
+  setSimilarityThreshold(value: number): void {
+    const clamped = Math.max(0, Math.min(1, value));
+    if (clamped === similarityThreshold) return;
+    similarityThreshold = clamped;
+    // Invalidate cached hunks so the next recompute repaints with the
+    // new threshold instead of short-circuiting on the same hunksKey.
+    for (const state of states.values()) {
+      state.lastHunksKey = "";
+      scheduleRecompute(state.bufferId).catch((e) =>
+        editor.error(`live-diff: ${e}`),
+      );
+    }
+  },
+  getSimilarityThreshold: () => similarityThreshold,
+} satisfies LiveDiffApi);
 
 // =============================================================================
 // Initialization
