@@ -1414,7 +1414,10 @@ impl Editor {
     /// Unload a plugin by name
     #[cfg(feature = "plugins")]
     fn handle_unload_plugin(&mut self, name: String, callback_id: JsCallbackId) {
-        match self.plugin_manager.write().unwrap().unload_plugin(&name) {
+        // Drop the write guard before the read lock below (match-scrutinee
+        // temporaries would otherwise live until end-of-match).
+        let result = self.plugin_manager.write().unwrap().unload_plugin(&name);
+        match result {
             Ok(()) => {
                 tracing::info!("Unloaded plugin: {}", name);
                 self.plugin_manager
