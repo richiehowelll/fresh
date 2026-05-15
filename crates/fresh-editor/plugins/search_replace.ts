@@ -964,6 +964,20 @@ const SEARCH_PUMP_INTERVAL_MS = 50;
  *  and after `batch.done` (which forces a full re-emit). */
 let lastStreamingFlatCount = 0;
 
+/** Absolute-path → index-into-`panel.fileGroups`, maintained while a
+ *  search is streaming so each new match locates its file group in
+ *  O(1) instead of triggering a full `buildFileGroups(allResults)`
+ *  rebuild (which is O(N) per batch and pins the JS event loop on
+ *  large result sets). Cleared at the start of each search. */
+let streamingFileIndexByPath: Map<string, number> | null = null;
+
+/** Carryover queue: matches the host handed us in a `take()` but that
+ *  we haven't processed yet because the batch was too big to drain in
+ *  a single pump iteration. Drained CHUNK at a time inside the pump
+ *  loop; `take()` is only re-called once this is empty so we don't
+ *  flood the queue.  Reset at the start of each search. */
+let pendingMatches: GrepMatch[] = [];
+
 /**
  * Perform a streaming search using a pull-based handle. The host writes
  * matches at full speed into shared state; this loop drains them via
@@ -986,6 +1000,13 @@ async function performSearch(pattern: string, silent?: boolean): Promise<SearchR
   // (mounting the empty Tree); subsequent batches append deltas to
   // that mounted Tree.
   lastStreamingFlatCount = 0;
+  streamingFileIndexByPath = new Map();
+  pendingMatches = [];
+  // Reset accumulating state so a re-search (debounce from typing,
+  // toggle flip, scope change) starts from empty rather than
+  // appending to the previous run's results.
+  panel.searchResults = [];
+  panel.fileGroups = [];
 
   // Cancel any in-flight search before kicking off a new one. Without
   // this the prior search would keep walking the project until it
@@ -1018,19 +1039,63 @@ async function performSearch(pattern: string, silent?: boolean): Promise<SearchR
         return allResults;
       }
 
-      const batch = handle.take();
-      if (batch.matches.length > 0) {
-        for (const m of batch.matches) {
-          // §1 scope filter: when scope is "current file only", drop
-          // matches from any other path. Done client-side because the
-          // host grep API is project-wide. Empty sourceBufferPath
-          // (unsaved buffer) filters everything out by design.
-          if (!panel.allFiles && m.file !== panel.sourceBufferPath) continue;
-          allResults.push({ match: m, selected: true });
-        }
-        panel.searchResults = allResults;
-        panel.fileGroups = buildFileGroups(allResults);
+      // Drain matches in chunks of at most CHUNK per pump iteration.
+      // `pendingMatches` accumulates anything the host gave us that we
+      // haven't processed yet. This caps the per-iteration synchronous
+      // JS work at O(CHUNK) so the event loop yields back to the host
+      // promptly — without this, a single batch of 3000+ matches takes
+      // ~700ms of JS time and queues every user keypress (Tab, typed
+      // chars, Esc) for the duration of the search.
+      //
+      // Only call `handle.take()` when our queue is empty, so the host
+      // doesn't keep us flooded; the producer pauses when the take()
+      // returns nothing left to drain.
+      let batchDone = false;
+      let batchTruncated = false;
+      let batchError: string | null = null;
+      if (pendingMatches.length === 0) {
+        const batch = handle.take();
+        batchDone = batch.done;
+        batchTruncated = batch.truncated;
+        batchError = batch.error ?? null;
+        for (const m of batch.matches) pendingMatches.push(m);
       }
+      const CHUNK = 250;
+      const chunkSize = Math.min(CHUNK, pendingMatches.length);
+      const chunk = pendingMatches.splice(0, chunkSize);
+      const moreInQueue = pendingMatches.length > 0;
+      const deltaItems: FlatItem[] = [];
+      const newExpandedKeys: string[] = []; // file rows added this batch
+      for (const m of chunk) {
+        // §1 scope filter: when scope is "current file only", drop
+        // matches from any other path. Done client-side because the
+        // host grep API is project-wide. Empty sourceBufferPath
+        // (unsaved buffer) filters everything out by design.
+        if (!panel.allFiles && m.file !== panel.sourceBufferPath) continue;
+        const result: SearchResult = { match: m, selected: true };
+        allResults.push(result);
+        let fileIdx = streamingFileIndexByPath?.get(m.file);
+        if (fileIdx === undefined) {
+          fileIdx = panel.fileGroups.length;
+          streamingFileIndexByPath?.set(m.file, fileIdx);
+          panel.fileGroups.push({
+            relPath: getRelativePath(m.file),
+            absPath: m.file,
+            expanded: true,
+            matches: [],
+          });
+          deltaItems.push({ type: "file", fileIndex: fileIdx });
+          const fileKey = `file:${fileIdx}`;
+          panel.expandedFileKeys.add(fileKey);
+          panel.knownFileKeys.add(fileKey);
+          newExpandedKeys.push(fileKey);
+        }
+        const matchIdx = panel.fileGroups[fileIdx].matches.length;
+        panel.fileGroups[fileIdx].matches.push(result);
+        deltaItems.push({ type: "match", fileIndex: fileIdx, matchIndex: matchIdx });
+      }
+      panel.searchResults = allResults;
+
       // Streaming updates use `appendTreeNodes` on the matchTree
       // widget rather than re-emitting the full panel spec. Without
       // this, a project-wide grep for a common word (thousands of
@@ -1038,52 +1103,54 @@ async function performSearch(pattern: string, silent?: boolean): Promise<SearchR
       // ~5000-row Tree on every 50 ms pump tick — multi-MB IPC traffic
       // that pins the host main thread, so Tab / Esc / typing the user
       // fires mid-search wait seconds for the pump to finish.
-      //
-      // Each batch we re-walk `buildFlatItems()` (cheap, fileGroups is
-      // O(matches)) and ship only the suffix that hasn't been sent
-      // yet via `appendTreeNodes`. The host grep walks files in order
-      // and never revisits one, so new flat items are always at the
-      // tail — pure append is correct. The file-row counts ("(N/M)")
-      // can lag behind the real selection set during streaming; the
-      // final batch flushes a full spec re-emit which fixes them.
-      if (batch.matches.length > 0 && panel.widgetPanel && lastStreamingFlatCount > 0) {
+      if (deltaItems.length > 0 && panel.widgetPanel && lastStreamingFlatCount > 0) {
         const W = Math.max(MIN_WIDTH, panel.viewportWidth - 2);
-        const flat = buildFlatItems();
-        if (flat.length > lastStreamingFlatCount) {
-          const newItems = flat.slice(lastStreamingFlatCount);
-          const newItemKeys = newItems.map(flatItemKey);
-          const newNodes = flatItemsToTreeNodes(newItems, newItemKeys, W);
-          panel.widgetPanel.appendTreeNodes("matchTree", newNodes, newItemKeys);
-          lastStreamingFlatCount = flat.length;
-          // Also push the new file rows' expansion state so children
-          // render. The host treats `setExpandedKeys` as the full list,
-          // which is fine.
+        const newItemKeys = deltaItems.map(flatItemKey);
+        const newNodes = flatItemsToTreeNodes(deltaItems, newItemKeys, W);
+        panel.widgetPanel.appendTreeNodes("matchTree", newNodes, newItemKeys);
+        lastStreamingFlatCount += deltaItems.length;
+        // Only re-push expansion state when *new* file rows appeared this
+        // batch — and only those new keys need to be in the set, since
+        // the host preserves prior expansion. We still send the full
+        // list because `setExpandedKeys` is "replace", but only when
+        // something actually changed.
+        if (newExpandedKeys.length > 0) {
           panel.widgetPanel.setExpandedKeys(
             "matchTree",
             [...panel.expandedFileKeys],
           );
         }
-      } else if (batch.matches.length > 0) {
+      } else if (deltaItems.length > 0) {
         // First streaming render or no tree mounted yet — emit the full
         // spec so the Tree exists for subsequent appends to target.
         updatePanelContent();
-        lastStreamingFlatCount = buildFlatItems().length;
+        lastStreamingFlatCount = panel.fileGroups.length + panel.searchResults.length;
       }
-      if (batch.done) {
+      // Only declare the producer finished when we have nothing left
+      // to process AND the most recent take() told us there's nothing
+      // more coming. While the queue still has carryover from a big
+      // batch, keep iterating.
+      const producerFinished = batchDone && pendingMatches.length === 0;
+      if (producerFinished) {
         // Final flush — full spec re-emit so the matchStats line,
         // file-row counts, and separator label all reflect the
         // final state (rather than the last-streaming snapshot).
         updatePanelContent();
         lastStreamingFlatCount = 0;
       }
-
-      if (batch.done) {
-        truncated = batch.truncated;
-        producerError = batch.error ?? null;
+      if (producerFinished) {
+        truncated = batchTruncated;
+        producerError = batchError;
         break;
       }
 
-      await editor.delay(SEARCH_PUMP_INTERVAL_MS);
+      // Yield to the JS event loop between chunks. `delay(0)` is
+      // enough — it lets queued plugin handlers (Tab, typed input,
+      // Esc) run between our streaming work. When there's no
+      // carryover, wait the usual pump interval so we don't hot-loop
+      // on `handle.take()`.
+      const yieldMs = moreInQueue ? 0 : SEARCH_PUMP_INTERVAL_MS;
+      await editor.delay(yieldMs);
     }
 
     if (activeSearchHandle === handle) {
@@ -1271,21 +1338,29 @@ async function executeReplacements(results?: SearchResult[]): Promise<string> {
 
 async function rerunSearch(): Promise<void> {
   if (!panel || !panel.searchPattern) return;
-  if (panel.busy) return; // guard against re-entrant search
-  // Invalidate any pending debounced timer so it doesn't fire after this
-  // search completes and flip busy=true behind the user's back (would
-  // race with the next Alt+Ret). See §3 / §17.
+  // No `panel.busy` early-return: if a search is already running for
+  // an older pattern (e.g. user typed "pr" then "proj"), we want the
+  // newer search to start NOW, not after the old one finishes
+  // walking the project. `performSearch` increments
+  // `currentSearchGeneration` and cancels the prior handle; the older
+  // in-flight `performSearch` sees the gen mismatch on its next
+  // pump tick and bails out without writing to panel state.
   searchDebounceGeneration++;
+  // Capture the generation this rerunSearch will own once performSearch
+  // increments it. If a newer rerunSearch slots in while we're awaiting,
+  // currentSearchGeneration moves past `myGen` and we know not to
+  // finalize busy/searchPerformed for this stale invocation.
+  const myGen = currentSearchGeneration + 1;
   panel.truncated = false;
   panel.busy = true;
   panel.matchIndex = 0;
   panel.scrollOffset = 0;
-  const results = await performSearch(panel.searchPattern);
-  // performSearch already updates panel.searchResults/fileGroups incrementally;
-  // just ensure final state is consistent
-  if (panel) {
-    panel.searchResults = results;
-    panel.fileGroups = buildFileGroups(results);
+  await performSearch(panel.searchPattern);
+  // performSearch maintains panel.searchResults / panel.fileGroups
+  // incrementally during streaming and emits a final `updatePanelContent`
+  // on batch.done; no need to rebuild here. Only finalize busy +
+  // searchPerformed if we are still the latest search.
+  if (panel && currentSearchGeneration === myGen) {
     panel.busy = false;
     panel.searchPerformed = true;
     updatePanelContent();
