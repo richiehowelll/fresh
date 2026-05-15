@@ -414,6 +414,12 @@ pub(crate) fn render_view_lines(input: LineRenderInput<'_>) -> LineRenderOutput 
         // Track byte positions for extend_to_line_end feature
         let mut first_line_byte_pos: Option<usize> = None;
         let mut last_line_byte_pos: Option<usize> = None;
+        // Carries the row-wide bg for a syntax category whose
+        // `bg_extends_to_line_end()` is true (diff Inserted /
+        // Deleted / Changed). Picked up by the tail-fill pass below
+        // so the bg wash continues past the scoped text to the
+        // viewport's right edge.
+        let mut syntax_extend_bg: Option<ratatui::style::Color> = None;
         // Reset the per-row touched set. Wrap continuations inherit
         // overlays still active from the previous row of the same
         // source line; new source lines do not (see OverlayActiveSet).
@@ -532,6 +538,19 @@ pub(crate) fn render_view_lines(input: LineRenderInput<'_>) -> LineRenderOutput 
                     Some(bp) => span_info_at(highlight_spans, &mut hl_cursor, bp),
                     None => (None, None, None),
                 };
+                // Diff categories carry a bg the renderer paints as a
+                // row wash. `span_bg_info_at` is an O(1) peek using
+                // the cursor `span_info_at` just advanced; no second
+                // walk.
+                let (highlight_bg, highlight_bg_extends) = match byte_pos {
+                    Some(bp) => {
+                        super::super::spans::span_bg_info_at(highlight_spans, hl_cursor, bp)
+                    }
+                    None => (None, false),
+                };
+                let highlight_bg_theme_key = highlight_bg
+                    .and(highlight_theme_key)
+                    .or(highlight_theme_key);
                 let semantic_token_color = match byte_pos {
                     Some(bp) => span_color_at(semantic_token_spans, &mut sem_cursor, bp),
                     None => None,
@@ -562,6 +581,8 @@ pub(crate) fn render_view_lines(input: LineRenderInput<'_>) -> LineRenderOutput 
                     theme,
                     highlight_color,
                     highlight_theme_key,
+                    highlight_bg,
+                    highlight_bg_theme_key,
                     semantic_token_color,
                     active_overlays: cell_overlays,
                     primary_cursor_position,
@@ -572,6 +593,15 @@ pub(crate) fn render_view_lines(input: LineRenderInput<'_>) -> LineRenderOutput 
                         && is_active,
                     current_line_bg: theme.current_line_bg,
                 });
+
+                // Remember this row's diff bg so the tail-fill pass can
+                // continue the wash past the scoped text. Only set
+                // when the category actually wants extension — keeps
+                // per-token bg scopes (none today, but possible) from
+                // unintentionally bleeding to the row's right edge.
+                if let (Some(bg), true) = (highlight_bg, highlight_bg_extends) {
+                    syntax_extend_bg = Some(bg);
+                }
 
                 // Record cell theme info for the theme inspector popup
                 if screen_width > 0 {
@@ -1031,6 +1061,7 @@ pub(crate) fn render_view_lines(input: LineRenderInput<'_>) -> LineRenderOutput 
                     current_view_line,
                     theme,
                     overlay_fill: overlay_sweep.fill_overlay(),
+                    syntax_extend_bg,
                     first_line_byte_pos,
                     last_line_byte_pos,
                 }) {

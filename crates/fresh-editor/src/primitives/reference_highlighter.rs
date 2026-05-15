@@ -520,6 +520,7 @@ impl ReferenceHighlighter {
                     highlights.push(HighlightSpan {
                         range: range.clone(),
                         color: self.highlight_color,
+                        bg: None,
                         category: None,
                     });
                 }
@@ -557,6 +558,7 @@ impl ReferenceHighlighter {
                         highlights.push(HighlightSpan {
                             range: range.clone(),
                             color: self.highlight_color,
+                            bg: None,
                             category: None,
                         });
                     }
@@ -571,6 +573,7 @@ impl ReferenceHighlighter {
                     highlights.push(HighlightSpan {
                         range: range.clone(),
                         color: self.highlight_color,
+                        bg: None,
                         category: None,
                     });
                 }
@@ -671,6 +674,7 @@ impl ReferenceHighlighter {
             .map(|(range, _)| HighlightSpan {
                 range,
                 color: self.highlight_color,
+                bg: None,
                 category: None,
             })
             .collect()
@@ -714,6 +718,7 @@ impl ReferenceHighlighter {
             .map(|range| HighlightSpan {
                 range,
                 color: self.highlight_color,
+                bg: None,
                 category: None,
             })
             .collect()

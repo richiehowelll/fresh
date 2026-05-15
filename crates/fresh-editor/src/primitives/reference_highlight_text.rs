@@ -99,6 +99,7 @@ impl TextReferenceHighlighter {
             .map(|range| HighlightSpan {
                 range,
                 color: self.highlight_color,
+                bg: None,
                 category: None,
             })
             .collect()

@@ -119,6 +119,7 @@ impl TextMateEngine {
                     .map(|span| HighlightSpan {
                         range: span.range.clone(),
                         color: highlight_color(span.category, theme),
+                        bg: None,
                         category: Some(span.category),
                     })
                     .collect();
@@ -272,6 +273,7 @@ impl TextMateEngine {
                 HighlightSpan {
                     range: span.range,
                     color: highlight_color(cat, theme),
+                    bg: None,
                     category: Some(cat),
                 }
             })

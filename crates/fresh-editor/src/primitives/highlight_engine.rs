@@ -39,7 +39,7 @@ use crate::model::buffer::Buffer;
 use crate::model::marker::{MarkerId, MarkerList};
 use crate::primitives::grammar::GrammarRegistry;
 use crate::primitives::highlighter::{
-    highlight_color, HighlightCategory, HighlightSpan, Highlighter, Language,
+    highlight_bg, highlight_color, HighlightCategory, HighlightSpan, Highlighter, Language,
 };
 use crate::view::theme::Theme;
 use std::collections::HashMap;
@@ -99,6 +99,30 @@ fn scope_to_category(scope: &str) -> Option<HighlightCategory> {
     // Strikethrough: markup.strikethrough
     if scope_lower.starts_with("markup.strikethrough") {
         return Some(HighlightCategory::Comment); // Strikethrough styled subdued
+    }
+
+    // Diff scopes (syntect's bundled `Diff` grammar). These scope the
+    // entire row, not just the leading +/-/@@ marker, so the renderer
+    // can paint a whole-line background by reading the span's bg.
+    //
+    //   markup.inserted.diff      — `+` line
+    //   markup.deleted.diff       — `-` line
+    //   meta.diff.range.unified   — `@@ ... @@` hunk header
+    //   markup.changed.*          — generic "changed" marker (rare)
+    //   meta.diff.header.*        — `diff --git`, `index ...`, file
+    //                               headers; render like Type so they
+    //                               stand out without a bg wash.
+    if scope_lower.starts_with("markup.inserted") {
+        return Some(HighlightCategory::Inserted);
+    }
+    if scope_lower.starts_with("markup.deleted") {
+        return Some(HighlightCategory::Deleted);
+    }
+    if scope_lower.starts_with("markup.changed") || scope_lower.starts_with("meta.diff.range") {
+        return Some(HighlightCategory::Changed);
+    }
+    if scope_lower.starts_with("meta.diff.header") {
+        return Some(HighlightCategory::Type);
     }
 
     // Keywords
@@ -513,6 +537,7 @@ impl TextMateEngine {
             .map(|span| HighlightSpan {
                 range: span.range.clone(),
                 color: highlight_color(span.category, theme),
+                bg: highlight_bg(span.category, theme),
                 category: Some(span.category),
             })
             .collect()
@@ -1094,6 +1119,7 @@ impl TextMateEngine {
                 HighlightSpan {
                     range: span.range,
                     color: highlight_color(cat, theme),
+                    bg: highlight_bg(cat, theme),
                     category: Some(cat),
                 }
             })
@@ -1483,6 +1509,7 @@ pub fn highlight_string(
                         spans.push(HighlightSpan {
                             range: byte_start..byte_end,
                             color: highlight_color(category, theme),
+                            bg: highlight_bg(category, theme),
                             category: Some(category),
                         });
                     }
@@ -1503,6 +1530,7 @@ pub fn highlight_string(
                     spans.push(HighlightSpan {
                         range: byte_start..byte_end,
                         color: highlight_color(category, theme),
+                        bg: highlight_bg(category, theme),
                         category: Some(category),
                     });
                 }

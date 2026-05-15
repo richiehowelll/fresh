@@ -59,9 +59,32 @@ pub enum HighlightCategory {
     String,
     Type,
     Variable,
+    /// `markup.inserted.*` — added lines in a diff. The renderer
+    /// fills the whole row's background with the theme's
+    /// `editor.diff_add_bg`. Foreground stays default so the row
+    /// stays readable.
+    Inserted,
+    /// `markup.deleted.*` — removed lines. Background fill from
+    /// `editor.diff_remove_bg`.
+    Deleted,
+    /// `meta.diff.range.*` / `markup.changed.*` — hunk header rows
+    /// and any "changed" markers. Background fill from
+    /// `editor.diff_modify_bg`.
+    Changed,
 }
 
 impl HighlightCategory {
+    /// Whether this category's background fill should extend past
+    /// the scoped text to the end of the visible row.
+    ///
+    /// Syntect's `Diff` grammar scopes each `+`/`-`/`@@` line up to
+    /// the trailing newline; without this flag the renderer would
+    /// stop the bg wash at the row's last character, leaving short
+    /// rows half-coloured.
+    pub fn bg_extends_to_line_end(&self) -> bool {
+        matches!(self, Self::Inserted | Self::Deleted | Self::Changed)
+    }
+
     /// Map a default language highlight index to a category
     pub fn from_default_index(index: usize) -> Option<Self> {
         match index {
@@ -125,6 +148,13 @@ impl HighlightCategory {
             Self::Operator => "syntax.operator",
             Self::PunctuationBracket => "syntax.punctuation_bracket",
             Self::PunctuationDelimiter => "syntax.punctuation_delimiter",
+            // Diff categories are bg-driven; the inspector surfaces
+            // the existing editor-level diff keys (also used by
+            // live_diff / side-by-side diff) rather than a separate
+            // syntax.* key.
+            Self::Inserted => "editor.diff_add_bg",
+            Self::Deleted => "editor.diff_remove_bg",
+            Self::Changed => "editor.diff_modify_bg",
         }
     }
 
@@ -144,6 +174,9 @@ impl HighlightCategory {
             Self::String => "String",
             Self::Type => "Type",
             Self::Variable => "Variable",
+            Self::Inserted => "Diff Inserted",
+            Self::Deleted => "Diff Deleted",
+            Self::Changed => "Diff Changed",
         }
     }
 }

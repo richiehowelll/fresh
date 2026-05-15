@@ -23,6 +23,13 @@ pub(super) struct CharStyleContext<'a> {
     pub highlight_color: Option<Color>,
     /// Theme key for the syntax highlight category (e.g. "syntax.keyword").
     pub highlight_theme_key: Option<&'static str>,
+    /// Pre-resolved syntax highlight background colour for this byte
+    /// position. `Some(..)` only for diff categories (Inserted /
+    /// Deleted / Changed); `None` keeps the existing fg-only path.
+    pub highlight_bg: Option<Color>,
+    /// Theme key for the bg above, when set. Surfaced to the theme
+    /// inspector.
+    pub highlight_bg_theme_key: Option<&'static str>,
     /// Pre-resolved semantic token color for this byte position.
     pub semantic_token_color: Option<Color>,
     /// Overlays currently active at `byte_pos`, already in priority-ascending
@@ -124,6 +131,18 @@ pub(super) fn compute_char_style(ctx: &CharStyleContext) -> CharStyleOutput {
         {
             style = style.fg(color);
             fg_theme_key = ctx.highlight_theme_key;
+        }
+    }
+
+    // Syntax-driven background: diff categories (markup.inserted /
+    // markup.deleted / meta.diff.range) carry a bg the renderer
+    // applies as a row wash. Slots BELOW overlays (so an
+    // `addOverlay` from a plugin can still paint over the diff
+    // colour) but ABOVE ANSI bg (so the syntax intent wins).
+    if let Some(bg) = ctx.highlight_bg {
+        style = style.bg(bg);
+        if let Some(key) = ctx.highlight_bg_theme_key {
+            bg_theme_key = Some(key);
         }
     }
 

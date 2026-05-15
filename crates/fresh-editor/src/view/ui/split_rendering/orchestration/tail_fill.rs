@@ -27,6 +27,12 @@ pub(super) struct TailFillInput<'a> {
     /// priority `extend_to_line_end` overlay that touched this row.
     /// `None` when no such overlay covered the row.
     pub overlay_fill: Option<&'a Overlay>,
+    /// Set by the cell loop when a syntect span scoped to this row
+    /// carries a bg AND its category's `bg_extends_to_line_end()` is
+    /// true (diff Inserted / Deleted / Changed). Lower priority than
+    /// `overlay_fill` so plugin overlays still win, higher priority
+    /// than the virtual-line fallback.
+    pub syntax_extend_bg: Option<ratatui::style::Color>,
     /// `Some` iff at least one cell on this row mapped to a source
     /// byte. Used to suppress the overlay-fill path on rows that
     /// contributed no bytes (virtual / empty lines fall through to
@@ -64,17 +70,31 @@ pub(super) fn resolve_tail_fill(input: TailFillInput<'_>) -> Option<TailFillResu
         current_view_line,
         theme,
         overlay_fill,
+        syntax_extend_bg,
         first_line_byte_pos,
         last_line_byte_pos,
     } = input;
 
-    let overlay_style = if first_line_byte_pos.is_some() && last_line_byte_pos.is_some() {
+    let row_had_source_bytes = first_line_byte_pos.is_some() && last_line_byte_pos.is_some();
+    let overlay_style = if row_had_source_bytes {
         overlay_fill.and_then(|overlay| overlay_bg_style(overlay, theme))
     } else {
         None
     };
 
-    let style = overlay_style.or_else(|| virtual_line_fallback_style(current_view_line, theme))?;
+    // Diff-syntax row-bg wash — slots between the overlay layer (so
+    // plugin overlays still win) and the virtual-line fallback. Set
+    // fg = bg so terminals that suppress empty-bg ANSI sequences
+    // still emit the colour, mirroring `overlay_bg_style`.
+    let syntax_style = if row_had_source_bytes {
+        syntax_extend_bg.map(|bg| Style::default().fg(bg).bg(bg))
+    } else {
+        None
+    };
+
+    let style = overlay_style
+        .or(syntax_style)
+        .or_else(|| virtual_line_fallback_style(current_view_line, theme))?;
 
     // Virtual lines stay None so visual-line motion keeps skipping
     // them; non-virtual rows carry the line's start byte (so empty

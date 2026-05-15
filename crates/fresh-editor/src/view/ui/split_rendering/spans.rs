@@ -280,6 +280,40 @@ pub(super) fn span_color_at(
     None
 }
 
+/// Background colour and category at `byte_pos`. Returns `(bg,
+/// extends_to_line_end)`.
+///
+/// `bg` is `Some(..)` only for the diff categories
+/// (`HighlightCategory::Inserted/Deleted/Changed`), whose syntect
+/// scopes (`markup.inserted/deleted/meta.diff.range`) cover an
+/// entire row. `extends_to_line_end` indicates the bg should fill
+/// the row past the span's end byte, so a short `+ foo` line still
+/// gets a wash across the rest of the viewport's columns.
+///
+/// Does **not** consume the cursor — the caller still owns the
+/// existing `span_info_at` walk for foreground / theme-key /
+/// display-name. Cheap because spans are sorted and non-overlapping;
+/// this is an O(1) peek given the same cursor `span_info_at` already
+/// advanced.
+#[inline]
+pub(super) fn span_bg_info_at(
+    spans: &[HighlightSpan],
+    cursor: usize,
+    byte_pos: usize,
+) -> (Option<Color>, bool) {
+    let Some(span) = spans.get(cursor) else {
+        return (None, false);
+    };
+    if span.range.start > byte_pos || span.range.end <= byte_pos {
+        return (None, false);
+    }
+    let extends = span
+        .category
+        .map(|c| c.bg_extends_to_line_end())
+        .unwrap_or(false);
+    (span.bg, extends)
+}
+
 /// Like `span_color_at` but also returns the theme key for the highlight category.
 pub(super) fn span_info_at(
     spans: &[HighlightSpan],

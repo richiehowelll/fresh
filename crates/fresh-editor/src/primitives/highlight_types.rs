@@ -25,6 +25,17 @@ pub enum HighlightCategory {
     String,
     Type,
     Variable,
+    /// `markup.inserted.*` — added lines in a diff. Fills the row's
+    /// background with `editor.diff_add_bg`; foreground stays at the
+    /// theme's default so the `+` token reads as plain text.
+    Inserted,
+    /// `markup.deleted.*` — removed lines. Background fill from
+    /// `editor.diff_remove_bg`.
+    Deleted,
+    /// `meta.diff.range.*` / `markup.changed.*` — hunk header rows
+    /// and any "changed" marker rows. Background fill from
+    /// `editor.diff_modify_bg`.
+    Changed,
 }
 
 /// A highlighted span of text with color information.
@@ -32,8 +43,14 @@ pub enum HighlightCategory {
 pub struct HighlightSpan {
     /// Byte range in the buffer
     pub range: Range<usize>,
-    /// Color for this span
+    /// Foreground color for this span
     pub color: Color,
+    /// Optional background color. Set for diff categories (Inserted,
+    /// Deleted, Changed); `None` for the existing fg-only categories.
+    /// When set on a category whose `bg_extends_to_line_end()` is
+    /// true, the renderer fills the rest of the visible row with
+    /// this bg even past the span's end byte.
+    pub bg: Option<Color>,
     /// The highlight category that produced this span (for theme inspection)
     pub category: Option<HighlightCategory>,
 }
@@ -52,6 +69,13 @@ impl HighlightCategory {
             Self::Operator => "syntax.operator",
             Self::PunctuationBracket => "syntax.punctuation_bracket",
             Self::PunctuationDelimiter => "syntax.punctuation_delimiter",
+            // Diff bg-driven categories reuse the existing
+            // editor-level diff colour keys (the same ones live_diff /
+            // side-by-side diff already use); the inspector surfaces
+            // those rather than a separate syntax.* key.
+            Self::Inserted => "editor.diff_add_bg",
+            Self::Deleted => "editor.diff_remove_bg",
+            Self::Changed => "editor.diff_modify_bg",
         }
     }
 
@@ -71,7 +95,22 @@ impl HighlightCategory {
             Self::String => "String",
             Self::Type => "Type",
             Self::Variable => "Variable",
+            Self::Inserted => "Diff Inserted",
+            Self::Deleted => "Diff Deleted",
+            Self::Changed => "Diff Changed",
         }
+    }
+
+    /// Whether this category's bg fill should extend past the
+    /// scoped text to the end of the visible row.
+    ///
+    /// Syntect's `Diff` grammar scopes the whole `+`/`-`/`@@` line
+    /// under `markup.inserted/deleted` / `meta.diff.range`, but the
+    /// scope ends at the trailing newline rather than the terminal's
+    /// right edge — leaving short rows half-coloured otherwise.
+    /// Matches the existing `extend_to_line_end` overlay behaviour.
+    pub fn bg_extends_to_line_end(&self) -> bool {
+        matches!(self, Self::Inserted | Self::Deleted | Self::Changed)
     }
 }
 
@@ -91,5 +130,27 @@ pub fn highlight_color(category: HighlightCategory, theme: &crate::view::theme::
         HighlightCategory::String => theme.syntax_string,
         HighlightCategory::Type => theme.syntax_type,
         HighlightCategory::Variable => theme.syntax_variable,
+        // Diff categories don't have a dedicated fg — they're a bg
+        // wash on top of the buffer's default fg. Return the editor
+        // foreground so cells keep readable contrast.
+        HighlightCategory::Inserted | HighlightCategory::Deleted | HighlightCategory::Changed => {
+            theme.editor_fg
+        }
+    }
+}
+
+/// Optional background color for a category. `None` for the existing
+/// fg-only categories; `Some(theme.editor.diff_*_bg)` for the diff
+/// categories so the renderer paints the row's bg with the same
+/// colours `live_diff` / side-by-side diff use.
+pub fn highlight_bg(
+    category: HighlightCategory,
+    theme: &crate::view::theme::Theme,
+) -> Option<Color> {
+    match category {
+        HighlightCategory::Inserted => Some(theme.diff_add_bg),
+        HighlightCategory::Deleted => Some(theme.diff_remove_bg),
+        HighlightCategory::Changed => Some(theme.diff_modify_bg),
+        _ => None,
     }
 }

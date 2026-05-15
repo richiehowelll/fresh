@@ -38,6 +38,26 @@ pub fn highlight_color(category: HighlightCategory, theme: &Theme) -> Color {
         HighlightCategory::String => theme.syntax_string,
         HighlightCategory::Type => theme.syntax_type,
         HighlightCategory::Variable => theme.syntax_variable,
+        // Diff categories are a background wash; foreground stays at
+        // the editor default so cells keep readable contrast.
+        HighlightCategory::Inserted | HighlightCategory::Deleted | HighlightCategory::Changed => {
+            theme.editor_fg
+        }
+    }
+}
+
+/// Optional background color for a highlight category.
+///
+/// Returns `Some(..)` only for the diff categories — those scope an
+/// entire line and want a row-wide bg wash. Every other category is
+/// foreground-only (`None`), preserving the current per-token render
+/// path.
+pub fn highlight_bg(category: HighlightCategory, theme: &Theme) -> Option<Color> {
+    match category {
+        HighlightCategory::Inserted => Some(theme.diff_add_bg),
+        HighlightCategory::Deleted => Some(theme.diff_remove_bg),
+        HighlightCategory::Changed => Some(theme.diff_modify_bg),
+        _ => None,
     }
 }
 
@@ -46,8 +66,14 @@ pub fn highlight_color(category: HighlightCategory, theme: &Theme) -> Color {
 pub struct HighlightSpan {
     /// Byte range in the buffer
     pub range: Range<usize>,
-    /// Color for this span
+    /// Foreground color for this span
     pub color: Color,
+    /// Optional background color. `Some(..)` only for diff categories
+    /// (Inserted, Deleted, Changed); `None` for the existing fg-only
+    /// scopes. When set on a category whose
+    /// `HighlightCategory::bg_extends_to_line_end()` is true, the
+    /// renderer fills the remainder of the visible row with this bg.
+    pub bg: Option<Color>,
     /// The highlight category that produced this span (for theme inspection)
     pub category: Option<HighlightCategory>,
 }
@@ -128,6 +154,7 @@ impl Highlighter {
                     .map(|span| HighlightSpan {
                         range: span.range.clone(),
                         color: highlight_color(span.category, theme),
+                        bg: None,
                         category: Some(span.category),
                     })
                     .collect();
@@ -229,6 +256,7 @@ impl Highlighter {
                 HighlightSpan {
                     range: span.range,
                     color: highlight_color(cat, theme),
+                    bg: None,
                     category: Some(cat),
                 }
             })

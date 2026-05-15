@@ -153,6 +153,7 @@ pub(crate) fn decoration_context(
                 semantic_token_spans.push(crate::primitives::highlighter::HighlightSpan {
                     range,
                     color: *color,
+                    bg: None,
                     category: None,
                 });
             }

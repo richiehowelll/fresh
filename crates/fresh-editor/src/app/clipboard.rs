@@ -303,6 +303,7 @@ impl Editor {
                         Some(crate::primitives::highlighter::HighlightSpan {
                             range: start..end,
                             color: span.color,
+                            bg: None,
                             category: span.category,
                         })
                     } else {
