@@ -23,11 +23,13 @@
 //!     which resets `key_context = Normal` because we were leaving a
 //!     terminal buffer.
 //!
-//! Observability: each test drives keyboard / mouse input and asserts
-//! purely on the rendered screen, per CONTRIBUTING §Testing — file
-//! contents only reach the screen when subsequent Down + Enter
-//! presses actually drive the file explorer, so the screen check is
-//! sufficient to verify focus transfer.
+//! Observability: per CONTRIBUTING §Testing, each test drives
+//! keyboard / mouse input and asserts purely on rendered screen
+//! content. The bug's user-visible signal is "Down doesn't drive
+//! the file explorer" — verified by waiting for the previewed
+//! file's contents to appear on screen. If keys leaked to the PTY,
+//! that content would never reach the screen and the test would
+//! time out externally.
 
 use crate::common::harness::EditorTestHarness;
 use crossterm::event::{KeyCode, KeyModifiers};
@@ -61,12 +63,11 @@ fn explorer_row_for(harness: &EditorTestHarness, name: &str) -> u16 {
 /// file explorer in a way that subsequent arrow keys reach the
 /// explorer, not the underlying terminal PTY.
 ///
-/// The assertion is purely on rendered output (per CONTRIBUTING
-/// §Testing): after `Ctrl+B` + `Down` + `Enter`, the previewed file's
-/// content must appear on screen. If keys were still being forwarded
-/// to the PTY (the bug), Down would scroll bash history and Enter
-/// would submit a (likely empty) command — `ALPHA_FILE_CONTENT` would
-/// never appear.
+/// Pure screen-observable assertion: after `Ctrl+B` opens the
+/// explorer and `Down` selects `alpha.txt`, the explorer's preview
+/// flow must open the file and the file's content must appear on
+/// screen. If keys still routed to the PTY, the screen would never
+/// gain that text.
 #[test]
 fn ctrl_b_from_terminal_transfers_keyboard_focus_to_file_explorer() {
     if !pty_available() {
@@ -78,42 +79,28 @@ fn ctrl_b_from_terminal_transfers_keyboard_focus_to_file_explorer() {
     let project = harness.project_dir().unwrap();
     fs::write(project.join("alpha.txt"), "ALPHA_FILE_CONTENT\n").unwrap();
 
-    // Open a terminal — this puts the editor in terminal mode.
+    // Wait for the terminal to actually render (its tab text appears
+    // in the tab bar) before sending Ctrl+B. Without this gate, on
+    // heavily-loaded CI the Ctrl+B can race ahead of the terminal's
+    // own async setup and the binding resolves against a transient
+    // pre-terminal context.
     harness.editor_mut().open_terminal();
-    harness.render().unwrap();
-    assert!(
-        harness.editor().is_terminal_mode(),
-        "precondition: opening a terminal should enter terminal mode"
-    );
+    harness.wait_for_screen_contains("*Terminal 0*").unwrap();
 
-    // Toggle the file explorer via the default `Ctrl+B` binding.
-    // `send_key` is synchronous: by the time it returns, `take_focus`
-    // has run, so the *immediate* post-condition is that we're no
-    // longer in terminal mode. Asserting this here catches the bug
-    // without waiting for async file-tree init (which could give
-    // plugin background work a chance to mutate key_context further
-    // and obscure whether the immediate effect of `Ctrl+B` was
-    // correct).
+    // Ctrl+B opens the file explorer. Wait for both the panel and
+    // the target item to render so the subsequent Down is observed
+    // against a fully-initialized tree.
     harness
         .send_key(KeyCode::Char('b'), KeyModifiers::CONTROL)
         .unwrap();
-    assert!(
-        !harness.editor().is_terminal_mode(),
-        "Ctrl+B from terminal must clear terminal_mode so dispatch_terminal_input \
-         stops swallowing keys destined for the file explorer (issue #2029)"
-    );
-
-    // End-to-end: with terminal_mode cleared, Down + Enter on the now
-    // initialized explorer must select and open `alpha.txt`. If the
-    // bug were re-introduced (Down going to the PTY), the file's
-    // contents would never reach the screen and this wait would hang
-    // until cargo nextest's external timeout fires.
     harness.wait_for_file_explorer().unwrap();
     harness.wait_for_file_explorer_item("alpha.txt").unwrap();
+
+    // Down selects the next item in the explorer and triggers a
+    // preview open (preview_tabs defaults to true). The preview's
+    // content reaching the screen is the user-visible signal that
+    // the keypress drove the explorer, not the underlying PTY.
     harness.send_key(KeyCode::Down, KeyModifiers::NONE).unwrap();
-    harness
-        .send_key(KeyCode::Enter, KeyModifiers::NONE)
-        .unwrap();
     harness
         .wait_for_screen_contains("ALPHA_FILE_CONTENT")
         .unwrap();
@@ -124,10 +111,12 @@ fn ctrl_b_from_terminal_transfers_keyboard_focus_to_file_explorer() {
 /// user can keep arrow-browsing previews. Today focus ends up on the
 /// previewed editor buffer.
 ///
-/// Observation: after click on `alpha.txt`, a `Down + Enter` should
-/// open `beta.txt` (the next file in the tree). With focus stuck on
-/// the editor instead of the explorer, Down moves the cursor inside
-/// alpha.txt and `BETA_FILE_CONTENT` never appears.
+/// Screen-observable test: after a click on `alpha.txt`, pressing
+/// `Down` should advance the explorer selection to `beta.txt` and
+/// trigger its preview — `beta.txt`'s content must appear on screen.
+/// With focus stolen to the editor (the bug), `Down` would move the
+/// cursor inside the alpha.txt buffer and `BETA_FILE_CONTENT` would
+/// never appear.
 #[test]
 fn click_in_explorer_while_terminal_active_keeps_focus_on_explorer() {
     if !pty_available() {
@@ -140,15 +129,15 @@ fn click_in_explorer_while_terminal_active_keeps_focus_on_explorer() {
     fs::write(project.join("alpha.txt"), "ALPHA_FILE_CONTENT\n").unwrap();
     fs::write(project.join("beta.txt"), "BETA_FILE_CONTENT\n").unwrap();
 
-    // Open a terminal — terminal_mode = true.
+    // Same precondition wait as 1a — terminal fully rendered before
+    // we send any keys against it.
     harness.editor_mut().open_terminal();
-    harness.render().unwrap();
-    assert!(harness.editor().is_terminal_mode());
+    harness.wait_for_screen_contains("*Terminal 0*").unwrap();
 
-    // Open the file explorer via `Ctrl+B`. The 1a fix clears
-    // `terminal_mode` here; this 1b test stresses what happens *after*
-    // — a single click on a file in the explorer must keep focus on
-    // the explorer rather than handing it to the previewed buffer.
+    // Open the file explorer. The 1a-style fix clears `terminal_mode`
+    // here; this 1b test stresses what happens *after* — a single
+    // click on a file must keep focus on the explorer rather than
+    // handing it to the previewed buffer.
     harness
         .send_key(KeyCode::Char('b'), KeyModifiers::CONTROL)
         .unwrap();
@@ -156,32 +145,19 @@ fn click_in_explorer_while_terminal_active_keeps_focus_on_explorer() {
     harness.wait_for_file_explorer_item("alpha.txt").unwrap();
     harness.wait_for_file_explorer_item("beta.txt").unwrap();
 
-    // Single-click `alpha.txt` in the explorer. The click is mouse-
-    // synchronous: by the time `mouse_click` returns, the click
-    // handler (and the preview open it triggers) have finished and
-    // key_context's immediate value should be FileExplorer.
+    // Single-click alpha.txt. Wait for the preview to render so the
+    // next keypress is observed against a settled UI.
     let alpha_row = explorer_row_for(&harness, "alpha.txt");
     harness.mouse_click(10, alpha_row).unwrap();
-    assert_eq!(
-        harness.editor().get_key_context(),
-        fresh::input::keybindings::KeyContext::FileExplorer,
-        "single-click in explorer must keep focus on FileExplorer; \
-         set_active_buffer must not steal it back to Normal when the \
-         previous buffer was a terminal (issue #2029, click_handlers.rs:554-557)"
-    );
     harness
         .wait_for_screen_contains("ALPHA_FILE_CONTENT")
         .unwrap();
 
-    // End-to-end: with focus on the explorer, Down should advance the
-    // *explorer* selection to `beta.txt` and Enter should preview it.
-    // If focus leaked to the editor (the bug), Down would move the
-    // cursor inside alpha.txt and the screen would never grow
-    // `BETA_FILE_CONTENT` — the wait would hang until external timeout.
+    // Down should advance the *explorer* selection to beta.txt and
+    // preview it. If focus leaked to the previewed editor buffer
+    // (the bug), Down would move the cursor inside alpha.txt and
+    // `BETA_FILE_CONTENT` would never appear.
     harness.send_key(KeyCode::Down, KeyModifiers::NONE).unwrap();
-    harness
-        .send_key(KeyCode::Enter, KeyModifiers::NONE)
-        .unwrap();
     harness
         .wait_for_screen_contains("BETA_FILE_CONTENT")
         .unwrap();
