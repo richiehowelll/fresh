@@ -107,4 +107,26 @@ fn open_dialog_scopes_to_current_project_then_reveals_all() {
         "Project B's session must still be listed in the all-projects view.\nScreen:\n{}",
         screen,
     );
+
+    // `/` focuses the filter; typing then narrows the list live. A
+    // query that matches nothing must filter LABEL_B out — proving
+    // both that `/` moved focus to the filter and that printable
+    // input reaches it.
+    harness
+        .send_key(KeyCode::Char('/'), KeyModifiers::NONE)
+        .unwrap();
+    harness.render().unwrap();
+    for ch in "qzqz".chars() {
+        harness
+            .send_key(KeyCode::Char(ch), KeyModifiers::NONE)
+            .unwrap();
+        harness.render().unwrap();
+    }
+    let screen = harness.screen_to_string();
+    assert!(
+        !screen.contains(LABEL_B),
+        "Typing a non-matching filter (after `/` focuses it) must hide \
+         unmatched sessions.\nScreen:\n{}",
+        screen,
+    );
 }

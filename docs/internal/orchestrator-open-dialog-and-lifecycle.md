@@ -521,58 +521,66 @@ total.
 
 ### Wireframe — new, default (scoped to current project)
 
-_As shipped (the title carries the project; a clickable scope
-toggle sits under the filter; the "N in other projects" affordance
-spells out the alternative):_
+_As shipped — tabular rows (`ID / NAME / PROJECT`), a labelled
+`Project:` scope control with the `Alt+P` hint baked in, a labelled
+`Filter` field (`/` focuses it), and a panel that fits the session
+count:_
 
 ```
 ╭─ ORCHESTRATOR :: Sessions  —  projB ────────────────────────────╮
-│ ╭─ projB · this project (2) ─╮ ╭─ [3] blog-redesign ──────────╮ │
-│ │ [ + New Session  ⌥N ]      │ │ [ Visit ]  [Details][Stop]…  │ │
-│ │ [type to filter…         ] │ │                              │ │
-│ │ [ ‹ This project › ]       │ │   (live session preview)     │ │
-│ │ [3] ACT  blog-redesign     │ │                              │ │
-│ │ [4] RUN  hotfix-2031       │ │                              │ │
-│ │ 2 in other projects · ⌥P   │ │                              │ │
+│ ╭─ Sessions ─────────────────╮ ╭─ [3] blog-redesign ──────────╮ │
+│ │ [ + New  Alt+N ]           │ │ [ Visit ]  [Details][Stop]…  │ │
+│ │ Project: [ projB ▾ (Alt+P)]│ │                              │ │
+│ │ Filter [type to search…/]  │ │   (live session preview)     │ │
+│ │ ────────────────────────── │ │                              │ │
+│ │ ID   NAME          PROJECT │ │                              │ │
+│ │ [3]  blog-redesign         │ │                              │ │
+│ │ [4]  hotfix-2031           │ │                              │ │
 │ ╰────────────────────────────╯ ╰──────────────────────────────╯ │
-│  ↑↓ nav · Enter dive · ⌥P all projects · Tab focus · Esc close  │
+│  ↑↓ nav · Enter dive · Alt+P all projects · Tab focus · Esc     │
 ╰──────────────────────────────────────────────────────────────────╯
 ```
 
-### Wireframe — new, all-projects view (`⌥P`)
+### Wireframe — new, all-projects view (`Alt+P`)
 
 ```
 ╭─ ORCHESTRATOR :: Sessions  —  all projects ─────────────────────╮
-│ ╭─ Sessions (4) ─────────────╮ ╭─ [3] blog-redesign ──────────╮ │
-│ │ [ + New Session  ⌥N ]      │ │ [ Visit ]  [Details][Stop]…  │ │
-│ │ [type to filter…         ] │ │                              │ │
-│ │ [ ‹ All projects › ]       │ │   (live session preview)     │ │
-│ │ [3] ACT  blog-redesign     │ │                              │ │
-│ │ [4] RUN  hotfix-2031       │ │                              │ │
-│ │ [1] RUN  fresh BASE · A    │ │                              │ │
-│ │ [2] RUN  feature-login · A │ │                              │ │
+│ ╭─ Sessions ─────────────────╮ ╭─ [3] blog-redesign ──────────╮ │
+│ │ [ + New  Alt+N ]           │ │ [ Visit ]  [Details][Stop]…  │ │
+│ │ Project: [ All ▾  (Alt+P) ]│ │                              │ │
+│ │ Filter [type to search…/]  │ │   (live session preview)     │ │
+│ │ ────────────────────────── │ │                              │ │
+│ │ ID   NAME          PROJECT │ │                              │ │
+│ │ [3]  blog-redesign         │ │                              │ │
+│ │ [4]  hotfix-2031           │ │                              │ │
+│ │ [1]  fresh BASE    projA   │ │                              │ │
+│ │ [2]  feature-login projA   │ │                              │ │
 │ ╰────────────────────────────╯ ╰──────────────────────────────╯ │
-│  ↑↓ nav · Enter dive · ⌥P current only · Tab focus · Esc close  │
+│  ↑↓ nav · Enter dive · Alt+P current only · Tab focus · Esc     │
 ╰──────────────────────────────────────────────────────────────────╯
 ```
 
-Sessions sort current-project-first; cross-project rows carry an
-inline `· <project>` basename tag rather than separator-row group
-headers (the list widget has no non-selectable rows, and threading
-headers through the selection/lifecycle indexing wasn't worth the
-regression risk). Current-first ordering already clusters each
-project, and the wider sessions column keeps the tags from
-truncating.
+Sessions sort current-project-first; the PROJECT column carries the
+project basename only for cross-project rows (current-project rows
+leave it blank) rather than separator-row group headers — the list
+widget has no non-selectable rows, and threading headers through the
+selection/lifecycle indexing wasn't worth the regression risk. The
+active session's `[id]` renders in the active-tab colour (there's no
+separate state column).
 
 ### Interaction notes
 
-- **Scope toggle**: a visible, clickable `[ ‹ This project › ]` /
-  `[ ‹ All projects › ]` button under the filter, plus the `⌥P`
-  chord (registered in the `orchestrator-open` mode, rendered via
-  `format_keybinding`, same pipeline as Stop/Archive/Delete). Both
-  call the same `toggleScope()`. Scope is also legible from the
-  title suffix and the section caption; the scoped view's "N in
-  other projects · ⌥P" affordance advertises the alternative.
+- **Scope control**: a labelled, clickable `Project: [ <name> ▾
+  (Alt+P) ]` button — clicking it or pressing `Alt+P` flips
+  current ↔ all (both call `toggleScope()`). The chord is registered
+  in the `orchestrator-open` mode and rendered via
+  `format_keybinding`. Scope is also legible from the title suffix.
+- **`/` focuses the filter**: bound as a plain-char chord in the
+  picker mode. The host's floating-panel key dispatch now defers
+  plain chars to an explicit mode binding before feeding them to the
+  focused text input (it already did this for named keys and
+  Ctrl/Alt chords), so a bare key like `/` reaches the plugin — at
+  the cost of not being typeable as filter text in that mode.
 - **Filter is always global**: typing in the scoped view still
   matches sessions in other projects (search never hides a session
   the user is clearly looking for).

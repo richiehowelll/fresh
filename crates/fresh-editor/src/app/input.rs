@@ -2845,19 +2845,17 @@ impl Editor {
             return true;
         }
         if let KeyCode::Char(c) = code {
-            // Ctrl/Alt-modified chords are swallowed by the floating
-            // panel without further action — a modal dialog must
-            // not leak keys to global bindings like Ctrl-P or
-            // Alt-F. Plain (or Shift-only) chars feed printable
-            // text into the focused TextInput.
-            //
-            // Exception: the active editor mode may have explicitly
-            // claimed the chord via `defineMode` (the Orchestrator
-            // picker binds `Alt+N` to its new-session shortcut, for
-            // example). Defer to that path so plugin-declared
-            // modal shortcuts work, mirroring the same precedence
-            // check the named-key branch above uses.
-            if modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) {
+            // The active editor mode may have explicitly claimed this
+            // char via `defineMode` — e.g. the Orchestrator picker
+            // binds `Alt+N` (new session), `Alt+P` (scope), and `/`
+            // (focus filter). Defer to that path so plugin-declared
+            // modal shortcuts work. This now covers *plain* chars too
+            // (not just Ctrl/Alt chords): a plugin that binds a bare
+            // key like `/` gets it before the text-input fast path.
+            // The trade-off is that a bound bare key can't also be
+            // typed as text in that mode, which is what the plugin
+            // asked for by binding it.
+            {
                 let mode_has_binding = self
                     .active_window()
                     .editor_mode
@@ -2873,6 +2871,13 @@ impl Editor {
                 if mode_has_binding {
                     return false;
                 }
+            }
+            // Ctrl/Alt-modified chords with no mode binding are
+            // swallowed by the floating panel without further action —
+            // a modal dialog must not leak keys to global bindings
+            // like Ctrl-P or Alt-F. Plain (or Shift-only) chars feed
+            // printable text into the focused TextInput.
+            if modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) {
                 return true;
             }
             let ch = if modifiers.contains(KeyModifiers::SHIFT) {
