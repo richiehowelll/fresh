@@ -1712,21 +1712,43 @@ impl Editor {
         }
     }
 
-    /// Save workspaces for every window whose split layout is populated.
+    /// Run `f` with `id` temporarily set as the active window, then
+    /// restore the previous active window. The single, guarded home for
+    /// the "act as another window" redirect the batch save/restore need:
+    /// the per-window workspace helpers (and `working_dir()`, which
+    /// derives from the active window's root) all key off
+    /// `self.active_window`, and the file-open machinery they call
+    /// (`Editor::open_file` → LSP / buffer alloc) is active-window-scoped,
+    /// so a `WindowId`-parameterized restore is implemented by this
+    /// redirect rather than threading an id through `open_file`.
     ///
-    /// Each window's workspace is keyed by its `root`, matching the
-    /// dir-keyed file naming `Workspace::save` uses. We temporarily flip
-    /// `active_window` so the existing per-window helpers (which read
-    /// `self.active_window`, and `working_dir()` which derives from it)
-    /// save the correct state to the correct path, then flip back.
-    /// Plugin hooks aren't fired because we bypass `set_active_window`.
+    /// This is a transient internal redirect — it deliberately does NOT
+    /// fire `active_window_changed` hooks (unlike `set_active_window`).
+    fn with_active_window<R>(&mut self, id: fresh_core::WindowId, f: impl FnOnce(&mut Self) -> R) -> R {
+        let prev = self.active_window;
+        self.active_window = id;
+        let result = f(self);
+        self.active_window = prev;
+        result
+    }
+
+    /// Save a specific window's workspace (keyed by its `root`).
+    pub fn save_workspace_for(&mut self, id: fresh_core::WindowId) -> Result<(), WorkspaceError> {
+        self.with_active_window(id, |e| e.save_workspace())
+    }
+
+    /// Restore a specific window's workspace from disk.
+    pub fn restore_workspace_for(&mut self, id: fresh_core::WindowId) -> Result<bool, WorkspaceError> {
+        self.with_active_window(id, |e| e.try_restore_workspace())
+    }
+
+    /// Save workspaces for every window whose split layout is populated.
+    /// Each window's workspace is keyed by its own `root`.
     ///
     /// Returns the first error encountered, if any; logs and continues
     /// past per-window failures so a single bad window can't block the
     /// other quits.
     pub fn save_all_windows_workspaces(&mut self) -> Result<(), WorkspaceError> {
-        let originally_active = self.active_window;
-
         let targets: Vec<fresh_core::WindowId> = self
             .windows
             .iter()
@@ -1736,16 +1758,13 @@ impl Editor {
 
         let mut first_err = None;
         for id in targets {
-            self.active_window = id;
-            if let Err(e) = self.save_workspace() {
+            if let Err(e) = self.save_workspace_for(id) {
                 tracing::warn!("Failed to save workspace for window {id}: {e}");
                 if first_err.is_none() {
                     first_err = Some(e);
                 }
             }
         }
-
-        self.active_window = originally_active;
 
         match first_err {
             Some(e) => Err(e),
@@ -1754,38 +1773,28 @@ impl Editor {
     }
 
     /// Restore workspaces for every persisted window that isn't the
-    /// already-restored active one. Each window's workspace file lives
-    /// under its own `root`, so we flip `active_window` + `working_dir`
-    /// per target and call the existing `try_restore_workspace` path —
-    /// it walks `self.active_window` everywhere, so the redirect routes
-    /// the buffers + splits into the right window.
+    /// already-restored active one, each from its own `root`.
     ///
     /// `plugin_global_state` is editor-wide and would otherwise be
-    /// clobbered by the last window we touch, so we snapshot it once
-    /// and restore it after the loop. The active window's restore
-    /// (run separately, before this) is the one whose plugin state we
-    /// keep.
+    /// clobbered by the last window we touch, so we snapshot it once and
+    /// restore it after the loop — the active window's restore (run
+    /// before this) is the one whose plugin state we keep.
     ///
     /// Best-effort: per-window failures are logged but don't stop the
     /// loop, so one corrupt workspace file can't blank the others.
     pub fn restore_inactive_window_workspaces(&mut self) {
-        let originally_active = self.active_window;
+        let active = self.active_window;
         let saved_plugin_state = self.plugin_global_state.clone();
 
         let targets: Vec<fresh_core::WindowId> = self
             .windows
             .keys()
             .copied()
-            .filter(|id| *id != originally_active)
+            .filter(|id| *id != active)
             .collect();
 
-        // `try_restore_workspace` keys off `working_dir()`, which derives
-        // from the active window's root — so pointing `active_window` at
-        // each shell is all that's needed to retarget the restore. No
-        // separate `working_dir` to swap.
         for id in targets {
-            self.active_window = id;
-            match self.try_restore_workspace() {
+            match self.restore_workspace_for(id) {
                 Ok(true) => tracing::debug!("Restored workspace for inactive window {id}"),
                 Ok(false) => tracing::trace!(
                     "No persisted workspace for inactive window {id}; seed layout kept"
@@ -1796,7 +1805,6 @@ impl Editor {
             }
         }
 
-        self.active_window = originally_active;
         self.plugin_global_state = saved_plugin_state;
     }
 }
