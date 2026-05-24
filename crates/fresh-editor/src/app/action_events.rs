@@ -109,31 +109,61 @@ impl crate::app::window::Window {
         let overlap = PAGE_OVERLAP.min(viewport_height.saturating_sub(1));
         let delta = (viewport_height.saturating_sub(overlap).max(1) as isize) * direction;
 
-        let old_top_byte = self
-            .buffers
-            .splits()
-            .map(|(_, vs)| vs)
-            .expect("active window must have a populated split layout")
-            .get(&split_id)?
-            .viewport
-            .top_byte;
-        self.handle_scroll_event(delta);
-        let new_top_byte = self
-            .buffers
-            .splits()
-            .map(|(_, vs)| vs)
-            .expect("active window must have a populated split layout")
-            .get(&split_id)?
-            .viewport
-            .top_byte;
+        // Track the viewport position as BOTH `top_byte` and
+        // `top_view_line_offset`.  In wrap mode a single long logical line
+        // scrolls by advancing `top_view_line_offset` (the wrap-segment
+        // index) while `top_byte` stays pinned at the line's start — so a
+        // `top_byte`-only "did it move?" check wrongly concludes the
+        // viewport is stuck and falls through to the logical-line handler,
+        // which clamps the cursor to EOF on a one-line document (the
+        // PageDown-overshoots bug on minified files).
+        let viewport_pos = |w: &Self| -> Option<(usize, usize)> {
+            let vp = &w
+                .buffers
+                .splits()
+                .map(|(_, vs)| vs)
+                .expect("active window must have a populated split layout")
+                .get(&split_id)?
+                .viewport;
+            Some((vp.top_byte, vp.top_view_line_offset))
+        };
 
-        if new_top_byte == old_top_byte {
+        let old_pos = viewport_pos(self)?;
+        self.handle_scroll_event(delta);
+        let new_pos = viewport_pos(self)?;
+
+        if new_pos == old_pos {
             // Viewport couldn't move (already at top/bottom of buffer).  Fall
             // back to the default cursor-only handler so PageDown at EOF
             // still clamps the cursor to the last line (and PageUp at BOF
             // clamps to byte 0), matching the historical behaviour.
             return None;
         }
+
+        // Byte of the visual row now shown at the very top of the viewport.
+        // For a soft-wrapped line this is `top_byte` advanced by
+        // `top_view_line_offset` wrap segments — NOT `top_byte` itself,
+        // which on a single hugely-wrapped line is always the document
+        // start (landing the cursor there would re-introduce the overshoot
+        // / jump-to-top bugs).
+        let target_byte = {
+            let buffer_id = self
+                .buffers
+                .splits()
+                .map(|(mgr, _)| mgr)
+                .expect("active window must have a populated split layout")
+                .buffer_for_split(split_id)?;
+            self.buffers
+                .with_buffer_and_split(buffer_id, split_id, |state, vs| {
+                    let soft_breaks = state.collect_soft_break_positions();
+                    let virtual_lines = state.collect_virtual_line_positions();
+                    vs.viewport.top_visual_row_source_byte(
+                        &mut state.buffer,
+                        &soft_breaks,
+                        &virtual_lines,
+                    )
+                })?
+        };
 
         // Emit a MoveCursor event placing each cursor at the new viewport
         // top.  The cursor is guaranteed visible (it's at row 0 of the new
@@ -159,7 +189,7 @@ impl crate::app::window::Window {
                 Event::MoveCursor {
                     cursor_id,
                     old_position: cursor.position,
-                    new_position: new_top_byte,
+                    new_position: target_byte,
                     old_anchor: cursor.anchor,
                     new_anchor,
                     old_sticky_column: cursor.sticky_column,

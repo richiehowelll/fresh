@@ -416,7 +416,147 @@ fn compute_wrap_row_count_for_text(
     rows.max(1)
 }
 
+/// Source byte at the start of each visual (word-wrap) row of `line_text`,
+/// where `line_start` is the absolute byte offset of the line.  The Nth
+/// entry is the byte position that the renderer draws at the start of the
+/// Nth visual row — the counterpart to [`compute_wrap_row_count_for_text`]
+/// (which only returns the row *count*).  Used to translate the viewport's
+/// `top_view_line_offset` (a visual-row index inside the logical line at
+/// `top_byte`) back into a buffer byte so PageUp/PageDown can land the
+/// cursor on the row actually shown at the top of the viewport — without
+/// this, a single hugely-wrapped line maps every visual row back to the
+/// line's start byte.
+fn wrap_segment_source_bytes(
+    line_text: &str,
+    line_start: usize,
+    effective_width: usize,
+    gutter_width: usize,
+    hanging_indent: bool,
+) -> Vec<usize> {
+    use crate::view::ui::split_rendering::transforms::apply_wrapping_transform;
+    use fresh_core::api::{ViewTokenWire, ViewTokenWireKind};
+
+    let tokens = vec![ViewTokenWire {
+        source_offset: Some(line_start),
+        kind: ViewTokenWireKind::Text(line_text.to_string()),
+        style: None,
+    }];
+    let wrapped = apply_wrapping_transform(tokens, effective_width, gutter_width, hanging_indent);
+
+    // Walk the stream exactly the way `compute_wrap_row_count_for_text`
+    // does (start a new row on each `Break`, only count rows with real
+    // content) but record the first content token's source byte per row.
+    let mut rows: Vec<usize> = Vec::new();
+    let mut row_has_content = false;
+    let mut row_first_byte: Option<usize> = None;
+    let note_content = |row_first_byte: &mut Option<usize>, src: Option<usize>| {
+        if row_first_byte.is_none() {
+            *row_first_byte = src;
+        }
+    };
+    for t in &wrapped {
+        match &t.kind {
+            ViewTokenWireKind::Newline => break,
+            ViewTokenWireKind::Break => {
+                if row_has_content {
+                    rows.push(row_first_byte.unwrap_or(line_start));
+                }
+                row_has_content = false;
+                row_first_byte = None;
+            }
+            ViewTokenWireKind::Text(s) => {
+                if !s.is_empty() {
+                    row_has_content = true;
+                    note_content(&mut row_first_byte, t.source_offset);
+                }
+            }
+            ViewTokenWireKind::Space | ViewTokenWireKind::BinaryByte(_) => {
+                row_has_content = true;
+                note_content(&mut row_first_byte, t.source_offset);
+            }
+        }
+    }
+    if row_has_content {
+        rows.push(row_first_byte.unwrap_or(line_start));
+    }
+    if rows.is_empty() {
+        rows.push(line_start);
+    }
+    rows
+}
+
 impl Viewport {
+    /// Source byte of the visual row currently shown at the top of the
+    /// viewport, accounting for `top_view_line_offset` rows into the
+    /// soft-wrapped logical line at `top_byte`.
+    ///
+    /// Mirrors the scroll primitives' notion of position: `scroll_*_visual`
+    /// keep `top_byte` at a logical-line start and stash the wrap-segment
+    /// index in `top_view_line_offset`.  PageUp/PageDown need the *byte* of
+    /// that row to land the cursor where the user is looking; using
+    /// `top_byte` alone teleports the cursor to the logical-line start,
+    /// which on a single hugely-wrapped file is the very top of the buffer.
+    ///
+    /// Returns `top_byte` when the offset is 0, when wrapping is off, or
+    /// when plugin soft-breaks / virtual lines intersect the line (those
+    /// rows aren't plain word-wrap segments — their byte mapping is owned
+    /// by the render pipeline, so we conservatively defer to `top_byte`).
+    pub fn top_visual_row_source_byte(
+        &mut self,
+        buffer: &mut Buffer,
+        soft_breaks: &[(usize, u16)],
+        virtual_lines: &[usize],
+    ) -> usize {
+        if !self.line_wrap_enabled || self.top_view_line_offset == 0 {
+            return self.top_byte;
+        }
+
+        let line_start = self.top_byte;
+        let mut iter = buffer.line_iterator(line_start, 80);
+        let line_content = match iter.next_line() {
+            Some((_, content)) => content.trim_end_matches(['\n', '\r']).to_string(),
+            None => return self.top_byte,
+        };
+        let line_end = line_start + line_content.len();
+
+        // Plugin soft-breaks / virtual rows make `top_view_line_offset`
+        // count rows that aren't plain word-wrap segments; their byte
+        // mapping lives in the render pipeline, so defer to the old
+        // behavior for those lines.
+        let touches_soft_break = soft_breaks
+            .iter()
+            .any(|(p, _)| *p >= line_start && *p < line_end);
+        let touches_virtual = virtual_lines
+            .iter()
+            .any(|p| *p >= line_start && *p <= line_end);
+        if touches_soft_break || touches_virtual {
+            return self.top_byte;
+        }
+
+        let gutter_width = self.gutter_width(buffer);
+        let wrap_config = WrapConfig::new(
+            self.effective_width() as usize,
+            gutter_width,
+            true,
+            self.wrap_indent,
+        );
+        let effective_width = wrap_config
+            .first_line_width
+            .saturating_add(wrap_config.gutter_width)
+            .max(2);
+        let seg_bytes = wrap_segment_source_bytes(
+            &line_content,
+            line_start,
+            effective_width,
+            wrap_config.gutter_width,
+            wrap_config.hanging_indent,
+        );
+        let idx = self
+            .top_view_line_offset
+            .min(seg_bytes.len().saturating_sub(1));
+        seg_bytes.get(idx).copied().unwrap_or(self.top_byte)
+    }
+
     /// Scroll up by N lines (byte-based)
     /// When line_wrap_enabled is true, scrolls by visual rows instead of logical lines
     ///

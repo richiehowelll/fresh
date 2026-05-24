@@ -89,6 +89,7 @@ pub mod migrated_virtual_lines;
 pub mod migrated_workspace;
 pub mod migrated_workspace_extras;
 pub mod multicursor;
+pub mod page_motion_single_long_line;
 pub mod phase_proofs;
 pub mod properties;
 pub mod regressions;
