@@ -583,10 +583,7 @@ fn cursor_column(
         Some(b) => b,
         None => return 0,
     };
-    let line_text = match std::str::from_utf8(&line_bytes) {
-        Ok(s) => s,
-        Err(_) => return 0,
-    };
+    let line_text = String::from_utf8_lossy(&line_bytes);
     let line_start = buffer.line_start_offset(line).unwrap_or(0);
     let byte_col = cursor_position.saturating_sub(line_start);
     line_text
@@ -2253,5 +2250,33 @@ mod tests {
         let top = format_cursor_position(1, 1, 10_000);
         let high = format_cursor_position(9_999, 999, 10_000);
         assert_eq!(top.len(), high.len());
+    }
+
+    #[test]
+    fn test_cursor_column_counts_chars_not_bytes() {
+        let buf = crate::model::buffer::TextBuffer::from_str_test("hello\ncafé résumé\nworld\n");
+        let line = 1;
+        let line_start = buf.line_start_offset(line).unwrap();
+
+        let at_r = line_start + 6;
+        let col = cursor_column(&buf, at_r, line);
+        assert_eq!(col, 5, "cursor at 'r' should be char column 5, not byte offset 6");
+
+        let at_e_acute = line_start + 3;
+        let col = cursor_column(&buf, at_e_acute, line);
+        assert_eq!(col, 3, "cursor at 'é' should be char column 3, not byte offset 3");
+
+        let at_u = line_start + 10;
+        let col = cursor_column(&buf, at_u, line);
+        assert_eq!(col, 8, "cursor at 'u' should be char column 8");
+
+        assert_ne!(at_r - line_start, 5, "byte offset != char column for multibyte text");
+    }
+
+    #[test]
+    fn test_cursor_column_out_of_range_line_returns_zero() {
+        let buf = crate::model::buffer::TextBuffer::from_str_test("hello\nworld\n");
+        let col = cursor_column(&buf, 0, 999);
+        assert_eq!(col, 0, "out-of-range line should return 0");
     }
 }
