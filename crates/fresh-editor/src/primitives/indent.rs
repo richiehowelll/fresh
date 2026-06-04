@@ -184,6 +184,11 @@ impl IndentCalculator {
                     fresh_languages::tree_sitter_templ::LANGUAGE.into(),
                     include_str!("../../queries/go/indents.scm"),
                 ),
+                Language::GdScript => (
+                    "gdscript",
+                    fresh_languages::tree_sitter_gdscript::LANGUAGE.into(),
+                    include_str!("../../queries/gdscript/indents.scm"),
+                ),
             };
 
             // Check if we already have this config
@@ -1507,6 +1512,64 @@ mod tests {
             "Enter after a block header must still indent one level deeper (got {:?})",
             indent
         );
+    }
+
+    #[test]
+    fn test_gdscript_indent_after_function_header() {
+        let mut calc = IndentCalculator::new();
+        let buffer = Buffer::from_str_test("func _ready():");
+        let indent = calc.calculate_indent(&buffer, buffer.len(), &Language::GdScript, 4);
+        assert_eq!(indent, Some(4), "got {:?}", indent);
+    }
+
+    #[test]
+    fn test_gdscript_indent_after_if_header() {
+        let mut calc = IndentCalculator::new();
+        let buffer = Buffer::from_str_test("func _ready():\n    if health > 0:");
+        let indent = calc.calculate_indent(&buffer, buffer.len(), &Language::GdScript, 4);
+        assert_eq!(indent, Some(8), "got {:?}", indent);
+    }
+
+    #[test]
+    fn test_gdscript_indent_after_for_header() {
+        let mut calc = IndentCalculator::new();
+        let buffer = Buffer::from_str_test("func collect(items):\n    for item in items:");
+        let indent = calc.calculate_indent(&buffer, buffer.len(), &Language::GdScript, 4);
+        assert_eq!(indent, Some(8), "got {:?}", indent);
+    }
+
+    #[test]
+    fn test_gdscript_nested_statement_keeps_indent() {
+        let mut calc = IndentCalculator::new();
+        let buffer = Buffer::from_str_test(
+            "func _physics_process(delta):\n    if delta > 0:\n        move()",
+        );
+        let indent = calc.calculate_indent(&buffer, buffer.len(), &Language::GdScript, 4);
+        assert_eq!(indent, Some(8), "got {:?}", indent);
+    }
+
+    #[test]
+    fn test_gdscript_bracket_continuation_indents() {
+        let mut calc = IndentCalculator::new();
+        let buffer = Buffer::from_str_test("var inventory = [");
+        let indent = calc.calculate_indent(&buffer, buffer.len(), &Language::GdScript, 4);
+        assert_eq!(indent, Some(4), "got {:?}", indent);
+    }
+
+    #[test]
+    fn test_gdscript_flow_exit_statements_dedent() {
+        let mut calc = IndentCalculator::new();
+        for stmt in ["return 42", "pass", "break", "continue"] {
+            let src = format!("func tick():\n    while true:\n        {stmt}");
+            let buffer = Buffer::from_str_test(&src);
+            let indent = calc.calculate_indent(&buffer, buffer.len(), &Language::GdScript, 4);
+            assert_eq!(
+                indent,
+                Some(4),
+                "Enter after `{stmt}` should dedent one level (got {:?})",
+                indent
+            );
+        }
     }
 
     #[test]

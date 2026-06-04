@@ -16,6 +16,8 @@ pub use tree_sitter_c_sharp;
 pub use tree_sitter_cpp;
 #[cfg(feature = "tree-sitter-css")]
 pub use tree_sitter_css;
+#[cfg(feature = "tree-sitter-gdscript")]
+pub use tree_sitter_gdscript;
 #[cfg(feature = "tree-sitter-go")]
 pub use tree_sitter_go;
 #[cfg(feature = "tree-sitter-html")]
@@ -210,6 +212,7 @@ pub enum Language {
     Pascal,
     Odin,
     Templ,
+    GdScript,
 }
 
 impl Language {
@@ -590,6 +593,23 @@ impl Language {
                 #[cfg(not(feature = "tree-sitter-templ"))]
                 Err("Templ language support not enabled".to_string())
             }
+            Self::GdScript => {
+                #[cfg(feature = "tree-sitter-gdscript")]
+                {
+                    let mut config = HighlightConfiguration::new(
+                        tree_sitter_gdscript::LANGUAGE.into(),
+                        "gdscript",
+                        GDSCRIPT_HIGHLIGHTS_QUERY,
+                        "",
+                        "",
+                    )
+                    .map_err(|e| format!("Failed to create GDScript highlight config: {e}"))?;
+                    config.configure(DEFAULT_HIGHLIGHT_CAPTURES);
+                    Ok(config)
+                }
+                #[cfg(not(feature = "tree-sitter-gdscript"))]
+                Err("GDScript language support not enabled".to_string())
+            }
         }
     }
 
@@ -626,6 +646,7 @@ impl Language {
             Language::Pascal,
             Language::Odin,
             Language::Templ,
+            Language::GdScript,
         ]
     }
 
@@ -652,6 +673,7 @@ impl Language {
             Self::Pascal => "pascal",
             Self::Odin => "odin",
             Self::Templ => "templ",
+            Self::GdScript => "gdscript",
         }
     }
 
@@ -698,6 +720,7 @@ impl Language {
             Self::Pascal => &["pas", "p"],
             Self::Odin => &["odin"],
             Self::Templ => &["templ"],
+            Self::GdScript => &["gd"],
         }
     }
 
@@ -724,6 +747,7 @@ impl Language {
             Self::Pascal => "Pascal",
             Self::Odin => "Odin",
             Self::Templ => "Templ",
+            Self::GdScript => "GDScript",
         }
     }
 
@@ -751,6 +775,7 @@ impl Language {
             "pascal" => Some(Self::Pascal),
             "odin" => Some(Self::Odin),
             "templ" => Some(Self::Templ),
+            "gdscript" | "gd_script" | "gd script" => Some(Self::GdScript),
             _ => None,
         }
     }
@@ -793,6 +818,7 @@ impl Language {
             "pascal" => Some(Self::Pascal),
             "odin" => Some(Self::Odin),
             "templ" => Some(Self::Templ),
+            "gdscript" | "gd script" => Some(Self::GdScript),
             _ => {
                 // Try matching shell variants
                 if name_lower.contains("bash") || name_lower.contains("shell") {
@@ -843,6 +869,9 @@ const DEFAULT_HIGHLIGHT_CAPTURES: &[&str] = &[
 /// known ones, so this still produces correct output.
 #[cfg(feature = "tree-sitter-templ")]
 const TEMPL_HIGHLIGHTS_QUERY: &str = include_str!("../queries/templ/highlights.scm");
+
+#[cfg(feature = "tree-sitter-gdscript")]
+const GDSCRIPT_HIGHLIGHTS_QUERY: &str = include_str!("../queries/gdscript/highlights.scm");
 
 // Only referenced by the TypeScript arm; unused when that grammar is disabled.
 #[allow(dead_code)]
@@ -937,6 +966,26 @@ mod tests {
     }
 
     #[test]
+    fn test_gdscript_detected_from_extension() {
+        let path = Path::new("player.gd");
+        assert!(matches!(
+            Language::from_path(path),
+            Some(Language::GdScript)
+        ));
+    }
+
+    #[test]
+    fn test_gdscript_ids_and_display_name() {
+        assert_eq!(Language::GdScript.id(), "gdscript");
+        assert_eq!(
+            Language::GdScript.lsp_language_id(Path::new("player.gd")),
+            "gdscript"
+        );
+        assert_eq!(Language::GdScript.display_name(), "GDScript");
+        assert_eq!(Language::from_id("gdscript"), Some(Language::GdScript));
+    }
+
+    #[test]
     #[cfg(feature = "tree-sitter-templ")]
     fn test_templ_highlight_config_builds() {
         // The combined Go + templ highlights query must parse cleanly against
@@ -945,6 +994,14 @@ mod tests {
         Language::Templ
             .highlight_config()
             .expect("Templ highlight config should build");
+    }
+
+    #[test]
+    #[cfg(feature = "tree-sitter-gdscript")]
+    fn test_gdscript_highlight_config_builds() {
+        Language::GdScript
+            .highlight_config()
+            .expect("GDScript highlight config should build");
     }
 
     /// Guard: `from_path` and `extensions()` must stay in sync — they used to

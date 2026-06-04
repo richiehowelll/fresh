@@ -3531,6 +3531,31 @@ impl Config {
         );
 
         languages.insert(
+            "gdscript".to_string(),
+            LanguageConfig {
+                extensions: vec!["gd".to_string()],
+                filenames: vec![],
+                grammar: "gdscript".to_string(),
+                comment_prefix: Some("#".to_string()),
+                auto_indent: true,
+                auto_close: None,
+                auto_surround: None,
+                textmate_grammar: None,
+                show_whitespace_tabs: true,
+                line_wrap: None,
+                wrap_column: None,
+                page_view: None,
+                page_width: None,
+                use_tabs: None,
+                tab_size: None,
+                formatter: None,
+                format_on_save: false,
+                on_save: vec![],
+                word_characters: None,
+            },
+        );
+
+        languages.insert(
             "c".to_string(),
             LanguageConfig {
                 extensions: vec!["c".to_string(), "h".to_string()],
@@ -5537,6 +5562,27 @@ impl Config {
             }]),
         );
 
+        // Godot's built-in GDScript language server listens on TCP port 6005
+        // when enabled in a running editor. Disabled by default to avoid
+        // warnings when Godot or netcat is unavailable.
+        lsp.insert(
+            "gdscript".to_string(),
+            LspLanguageConfig::Multi(vec![LspServerConfig {
+                command: "nc".to_string(),
+                args: vec!["127.0.0.1".to_string(), "6005".to_string()],
+                enabled: false,
+                auto_start: false,
+                process_limits: ProcessLimits::default(),
+                initialization_options: None,
+                env: Default::default(),
+                language_id_overrides: Default::default(),
+                name: Some("Godot GDScript".to_string()),
+                only_features: None,
+                except_features: None,
+                root_markers: vec!["project.godot".to_string(), ".git".to_string()],
+            }]),
+        );
+
         // typescript-language-server (installed via npm)
         // Alternative: use "deno lsp" with initialization_options: {"enable": true}
         lsp.insert(
@@ -6925,6 +6971,8 @@ mod tests {
         assert_eq!(config.editor.tab_size, 4);
         assert!(config.editor.line_numbers);
         assert!(config.editor.syntax_highlighting);
+        assert!(config.languages.contains_key("gdscript"));
+        assert_eq!(config.languages["gdscript"].extensions, vec!["gd"]);
         // keybindings is empty by design - it's for user customizations only
         // The actual keybindings come from resolve_keymap(active_keybinding_map)
         assert!(config.keybindings.is_empty());
@@ -7355,6 +7403,17 @@ mod tests {
                 lsp_key
             );
         }
+    }
+
+    #[test]
+    #[cfg(feature = "runtime")]
+    fn test_gdscript_lsp_disabled_by_default() {
+        let config = Config::default();
+        let server = &config.lsp["gdscript"].as_slice()[0];
+        assert_eq!(server.command, "nc");
+        assert_eq!(server.args, vec!["127.0.0.1", "6005"]);
+        assert!(!server.enabled);
+        assert_eq!(server.name.as_deref(), Some("Godot GDScript"));
     }
 
     #[test]
