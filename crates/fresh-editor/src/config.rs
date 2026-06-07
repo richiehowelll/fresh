@@ -750,7 +750,7 @@ pub struct StatusBarConfig {
 }
 
 fn default_status_bar_separator() -> String {
-    "|".to_string()
+    "".to_string()
 }
 
 impl Default for StatusBarConfig {
