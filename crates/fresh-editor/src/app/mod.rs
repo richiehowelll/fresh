@@ -78,6 +78,7 @@ mod stdin_stream;
 mod tab_drag;
 mod terminal;
 mod terminal_input;
+mod terminal_link;
 mod terminal_mouse;
 mod text_ops;
 mod theme_inspect;
@@ -580,9 +581,10 @@ pub struct Editor {
     // Each window has its own preview slot.
 
     // suppress_position_history_once moved onto `Window` (Step 0f).
-    /// Filesystem manager for file explorer
-    fs_manager: Arc<FsManager>,
-
+    // The file explorer and Open File browser ride per-window fs_managers
+    // (`WindowResources::fs_manager`, derived from each window's authority), so
+    // the editor no longer holds a global one that could go stale against the
+    // active authority.
     /// Single backend slot for "where does the editor act?".
     ///
     /// Bundles filesystem, process spawner, terminal wrapper, and
@@ -664,6 +666,24 @@ pub struct Editor {
     /// Local windows have no entry. This is the per-window analogue of the
     /// process-level keepalive the restart-based attach parks.
     pub(crate) session_keepalives: HashMap<fresh_core::WindowId, Box<dyn std::any::Any + Send>>,
+
+    /// Request ids of `attachRemoteAgent` connects currently in flight (added
+    /// when the connect is spawned, removed when it settles). Lets a plugin
+    /// cancel a pending connect (the New-Session dialog's Cancel).
+    pub(crate) remote_attach_inflight: std::collections::HashSet<u64>,
+    /// Request ids of in-flight attaches the plugin asked to cancel. When the
+    /// connect later resolves, the result (authority + carrier keepalive) is
+    /// dropped instead of installed — so no window is created and the carrier
+    /// is torn down — and a failure is ignored.
+    pub(crate) remote_attach_cancelled: std::collections::HashSet<u64>,
+    /// Cancellation senders for the background connect threads, keyed by
+    /// request id. The connect runs on a detached thread (so the carrier's
+    /// runtime outlives it); signalling here makes that thread's `select!` drop
+    /// the in-flight connect future, which drops the ssh child (spawned
+    /// kill-on-drop) — so even a hung handshake leaves no orphaned process. The
+    /// thread then finishes and its result is discarded. Cleared on settle.
+    pub(crate) remote_attach_cancels:
+        std::collections::HashMap<u64, tokio::sync::oneshot::Sender<()>>,
 
     /// Id of the currently active session. Always `WindowId(1)` for
     /// now; multi-session support arrives in a follow-up commit.
@@ -1079,6 +1099,13 @@ pub(crate) enum PanelPlacement {
     /// chrome is laid out in the remaining width; no background
     /// dimming. Non-modal — see `FloatingWidgetState::focused`.
     LeftDock { width_cols: u16 },
+    /// Content-sized popup anchored near a screen cell — a right-click
+    /// context menu. Drawn at `(x, y)` (clamped to stay fully on
+    /// screen), sized to its rendered content, with **no** background
+    /// dimming, so it reads as an unobtrusive popup rather than a modal.
+    /// Still input-modal via the `FloatingModal` layer: keys route to it
+    /// and a click outside dismisses it.
+    Anchored { x: u16, y: u16 },
 }
 
 #[derive(Debug, Clone)]
@@ -3593,5 +3620,95 @@ mod tests {
             })
             .sum();
         assert!(view_state.tab_scroll_offset <= total_width);
+    }
+
+    /// Regression for sinelaw/fresh#2229.
+    ///
+    /// When the tab strip is scrolled (many tabs open) and the user invokes
+    /// "Close Others" / "Close to Left" / "Close to Right" / "Close All",
+    /// the surviving active tab must stay on-screen. Before the fix the
+    /// scroll offset was carried over from the pre-close state, so the only
+    /// remaining tab sat to the left of the viewport and the tab bar
+    /// looked empty.
+    #[test]
+    fn close_others_re_anchors_tab_scroll_to_surviving_tab() {
+        let config = Config::default();
+        let (dir_context, _temp) = test_dir_context();
+        let mut editor = Editor::new(
+            config,
+            80,
+            24,
+            dir_context,
+            crate::view::color_support::ColorCapability::TrueColor,
+            test_filesystem(),
+        )
+        .unwrap();
+        let split_id = editor.split_manager().active_split();
+
+        // Open enough long-named buffers that the strip would scroll on a
+        // realistic terminal width.
+        use crate::view::split::TabTarget;
+        let mut buffers = Vec::new();
+        for i in 0..6 {
+            let id = editor.new_buffer();
+            editor
+                .buffers_mut()
+                .get_mut(&id)
+                .unwrap()
+                .buffer
+                .rename_file_path(std::path::PathBuf::from(format!(
+                    "long_filename_for_tab_{:02}.txt",
+                    i
+                )));
+            buffers.push(id);
+        }
+
+        // Make the last buffer the active one and seed a scrolled offset
+        // — what the renderer would have computed mid-session — then mark
+        // it as the surviving "keep" tab.
+        let keep = buffers[5];
+        editor
+            .active_window_mut()
+            .split_manager_mut()
+            .unwrap()
+            .set_split_buffer(split_id, keep);
+        {
+            let view_state = editor.split_view_states_mut().get_mut(&split_id).unwrap();
+            view_state.open_buffers = buffers
+                .iter()
+                .map(|b| TabTarget::Buffer(*b))
+                .collect::<Vec<_>>();
+            view_state.tab_scroll_offset = 80;
+        }
+
+        editor.close_other_tabs_in_split(keep, split_id);
+
+        // Only the kept tab remains. Its visual range is [0, tab_width)
+        // and it must be inside the viewport — i.e. the offset must fit
+        // within the total tab strip width.
+        let view_state = editor.split_view_states().get(&split_id).unwrap();
+        let remaining_targets = view_state.buffer_tab_ids_vec();
+        assert_eq!(
+            remaining_targets,
+            vec![keep],
+            "Close Others should leave only the kept buffer"
+        );
+        let name_len = editor
+            .buffers()
+            .get(&keep)
+            .unwrap()
+            .buffer
+            .file_path()
+            .and_then(|p| p.file_name())
+            .and_then(|n| n.to_str())
+            .map(|s| s.chars().count())
+            .unwrap_or(0);
+        let kept_tab_width = 2 + name_len;
+        assert!(
+            view_state.tab_scroll_offset < kept_tab_width,
+            "scroll offset {} must keep the {}-wide kept tab in view (without the fix it stays at 80)",
+            view_state.tab_scroll_offset,
+            kept_tab_width,
+        );
     }
 }

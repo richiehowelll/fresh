@@ -133,7 +133,6 @@ pub(super) struct EditorParts {
     // Async / IO
     pub(super) tokio_runtime: Option<Arc<tokio::runtime::Runtime>>,
     pub(super) async_bridge: AsyncBridge,
-    pub(super) fs_manager: Arc<FsManager>,
     pub(super) authority: crate::services::authority::Authority,
     pub(super) local_filesystem: Arc<dyn FileSystem + Send + Sync>,
 
@@ -209,12 +208,14 @@ impl Editor {
             paste_pending: std::collections::HashMap::new(),
             paste_slow_path_just_armed: false,
             paste_render_suppress_until: None,
-            fs_manager: parts.fs_manager,
             authority: parts.authority,
             local_filesystem: parts.local_filesystem,
             menu_state: crate::view::ui::MenuState::new(parts.dir_context.themes_dir()),
             windows: parts.windows,
             session_keepalives: HashMap::new(),
+            remote_attach_inflight: std::collections::HashSet::new(),
+            remote_attach_cancelled: std::collections::HashSet::new(),
+            remote_attach_cancels: std::collections::HashMap::new(),
             active_window: parts.active_window,
             next_window_id: parts.next_window_id,
             command_registry: parts.command_registry,
@@ -373,6 +374,7 @@ impl Editor {
         std::sync::Arc::get_mut(&mut grammar_registry)
             .expect("defaults_only returned a shared Arc")
             .apply_language_config(&config.languages);
+        crate::config::reload_indent_overrides(&config.languages);
         tracing::info!("Default grammar registry built in {:?}", start.elapsed());
         // Don't start background grammar build here — it's deferred to the
         // first flush_pending_grammars() call so that plugin-registered grammars
@@ -428,6 +430,7 @@ impl Editor {
         std::sync::Arc::get_mut(&mut grammar_registry)
             .expect("grammar registry Arc must be uniquely owned at for_test entry")
             .apply_language_config(&config.languages);
+        crate::config::reload_indent_overrides(&config.languages);
         let authority = Self::local_authority_with_filesystem(filesystem);
         let mut editor = Self::with_options(
             config,
@@ -1245,7 +1248,6 @@ impl Editor {
             color_capability,
             tokio_runtime,
             async_bridge,
-            fs_manager,
             authority,
             local_filesystem: Arc::clone(&local_filesystem),
             windows,

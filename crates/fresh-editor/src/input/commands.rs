@@ -879,6 +879,13 @@ static COMMAND_DEFS: &[CommandDef] = &[
         custom_contexts: &[],
     },
     CommandDef {
+        name_key: "cmd.toggle_occurrence_highlight",
+        desc_key: "cmd.toggle_occurrence_highlight_desc",
+        action: || Action::ToggleOccurrenceHighlight,
+        contexts: &[Normal],
+        custom_contexts: &[],
+    },
+    CommandDef {
         name_key: "cmd.toggle_page_view",
         desc_key: "cmd.toggle_page_view_desc",
         action: || Action::TogglePageView,
@@ -953,6 +960,13 @@ static COMMAND_DEFS: &[CommandDef] = &[
         name_key: "cmd.find_selection_previous",
         desc_key: "cmd.find_selection_previous_desc",
         action: || Action::FindSelectionPrevious,
+        contexts: &[Normal],
+        custom_contexts: &[],
+    },
+    CommandDef {
+        name_key: "cmd.clear_search",
+        desc_key: "cmd.clear_search_desc",
+        action: || Action::ClearSearch,
         contexts: &[Normal],
         custom_contexts: &[],
     },

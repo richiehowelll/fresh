@@ -201,6 +201,14 @@ type TsCompositeHunk = {
 	* Number of lines in new buffer
 	*/
 	newCount: number;
+	/**
+	* Per-line operations for the hunk, in git order: one char per line —
+	* `' '` context, `'-'` deletion (old only), `'+'` addition (new only).
+	* When present, the side-by-side alignment follows git's classification
+	* exactly (unchanged lines stay paired); when absent, the host falls back
+	* to a positional pairing. Optional for backward compatibility.
+	*/
+	ops?: string;
 };
 type TsCreateCompositeBufferOptions = {
 	/**
@@ -662,6 +670,17 @@ type CreateWindowWithTerminalOptions = {
 	* when `command` is set, or "Terminal N" otherwise.
 	*/
 	title?: string;
+	/**
+	* Argv to run on *restore* instead of re-running `command`, when
+	* the session is reopened after an editor restart. Used by
+	* Orchestrator agent-resume: a session launched with
+	* `claude --session-id <id>` sets `resume` to
+	* `["claude", "--resume", "<id>"]` (or `["claude", "--continue"]`),
+	* so a restored session rejoins its conversation rather than starting
+	* a fresh agent. `None` keeps `command` as the restore command. The id
+	* is a plain argv element — never interpolated into a shell string.
+	*/
+	resume?: Array<string>;
 };
 type SessionWithTerminalResult = {
 	/**
@@ -1551,12 +1570,17 @@ type RemoteAgentTransport = {
 	workspace?: string | null;
 } | {
 	kind: "ssh";
-	user: string;
+	/** Login user. Optional — omit for `host` / `ssh://host`, letting ssh pick
+	* the user from its own config or the current local user. */
+	user?: string | null;
 	host: string;
 	port?: number | null;
 	identity_file?: string | null;
 	/** Remote directory to root the session at. */
 	remote_path?: string | null;
+	/** Extra `ssh` arguments (e.g. `-J jump`, `-o ProxyCommand=…`) applied to
+	* every ssh invocation for this session. */
+	extra_args?: string[];
 };
 type RemoteAgentSpec = {
 	transport: RemoteAgentTransport;
@@ -1669,6 +1693,11 @@ interface EditorAPI {
 	* Get the active split ID
 	*/
 	getActiveSplitId(): number;
+	/**
+	* Returns true when search highlights are currently active in the buffer.
+	* Becomes true after a search is confirmed; false once cleared.
+	*/
+	hasActiveSearch(): boolean;
 	/**
 	* List all open buffers - returns array of BufferInfo objects
 	*/
@@ -3010,18 +3039,30 @@ interface EditorAPI {
 	*/
 	clearAuthority(): void;
 	/**
-	* Attach to a remote agent that needs a live connection (today a
-	* `kubectl exec` agent in a Kubernetes pod). The connect is asynchronous:
-	* this returns immediately, the editor connects in the background,
-	* and only on success installs the authority and restarts (on
-	* failure it surfaces the error and stays put). Fire-and-forget,
-	* like `setAuthority` — any post-attach work belongs in the
-	* plugin's post-restart init.
+	* Attach to a remote agent that needs a live connection (an SSH host or a
+	* `kubectl exec` agent in a Kubernetes pod). The connect is asynchronous —
+	* the editor spawns the carrier, bootstraps the agent and builds the
+	* session in the background — and this returns a promise that settles on
+	* the real outcome:
+	* 
+	* * resolves once the session (authority + window) is fully
+	* constructed, so a caller can keep its dialog open until there is a
+	* real session to show;
+	* * rejects with the failure reason (e.g. ssh "Could not resolve
+	* hostname") if the connect or window creation fails — in which case
+	* no window is created and the editor stays on its current authority.
 	* 
 	* The payload schema (`RemoteAgentSpec`) lives in `fresh-editor`;
 	* plugins hand-build an object matching it.
 	*/
-	attachRemoteAgent(payload: RemoteAgentSpec): boolean;
+	attachRemoteAgent(payload: RemoteAgentSpec): Promise<void>;
+	/**
+	* Cancel any in-flight `attachRemoteAgent` connect — the New-Session
+	* dialog's Cancel. The pending promise rejects with "cancelled" and the
+	* background connect's late result is discarded, so no window is built.
+	* A no-op when nothing is connecting.
+	*/
+	cancelRemoteAgent(): void;
 	/**
 	* Activate an environment: set the live env recipe (`snippet` run in
 	* `dir`). Applied to every spawn, re-evaluated on demand — no restart.
@@ -3429,6 +3470,16 @@ interface HookEventMap {
 	action_popup_result: {
 		popup_id: string;
 		action_id: string;
+	};
+	/**
+	* User clicked a plugin-registered status-bar token. Subscribers
+	* filter by `plugin_name` + `token_name`. Use this to re-open a
+	* deferred prompt or surface the relevant settings UI for whatever
+	* the token represents (e.g. trust chip → trust-elevation popup).
+	*/
+	status_bar_token_clicked: {
+		plugin_name: string;
+		token_name: string;
 	};
 	process_output: {
 		process_id: number;

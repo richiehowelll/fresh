@@ -907,6 +907,14 @@ pub struct CompositeHunk {
     #[serde(rename = "newCount")]
     #[ts(rename = "newCount")]
     pub new_count: usize,
+    /// Per-line operations for the hunk, in git order: one char per line —
+    /// `' '` context, `'-'` deletion (old only), `'+'` addition (new only).
+    /// When present, the side-by-side alignment follows git's classification
+    /// exactly (unchanged lines stay paired); when absent, the host falls back
+    /// to a positional pairing. Optional for backward compatibility.
+    #[serde(default, rename = "ops")]
+    #[ts(rename = "ops", optional)]
+    pub ops: Option<String>,
 }
 
 /// Options for creating a composite buffer (used by plugin API)
@@ -1200,6 +1208,12 @@ pub struct EditorStateSnapshot {
     pub terminal_width: u16,
     #[serde(default)]
     pub terminal_height: u16,
+
+    /// Whether search highlights are currently active in the active buffer.
+    /// True when a search has been confirmed and its match overlays are visible.
+    /// Cleared when the search is cancelled or a new search is started.
+    #[serde(default)]
+    pub has_active_search: bool,
 }
 
 /// Total terminal size in cells. Returned by `editor.getScreenSize()`.
@@ -1246,6 +1260,7 @@ impl EditorStateSnapshot {
             active_session_plugin_states: HashMap::new(),
             terminal_width: 0,
             terminal_height: 0,
+            has_active_search: false,
         }
     }
 }
@@ -2220,6 +2235,9 @@ pub enum PluginCommand {
         cwd: Option<String>,
         command: Option<Vec<String>>,
         title: Option<String>,
+        /// Restore-time argv (agent resume); see
+        /// `CreateWindowWithTerminalOptions::resume`.
+        resume: Option<Vec<String>>,
         request_id: u64,
     },
 
@@ -3670,7 +3688,17 @@ pub enum PluginCommand {
     AttachRemoteAgent {
         #[ts(type = "unknown")]
         payload: JsonValue,
+        /// JS callback id of the returned promise. The editor settles it once
+        /// the session is fully constructed (resolve) or the connect/window
+        /// creation fails (reject), so the plugin can await the real outcome.
+        request_id: u64,
     },
+
+    /// Cancel every in-flight `attachRemoteAgent` connect. The New-Session
+    /// dialog's Cancel: the awaiting promise is rejected immediately and the
+    /// (uninterruptible) background connect's eventual result is discarded so
+    /// no window is ever built. A no-op when nothing is in flight.
+    CancelRemoteAttach,
 
     /// Activate an environment: set the live env provider's recipe (an
     /// activation shell `snippet` run in `dir`). Re-evaluated on demand on the
@@ -4466,6 +4494,17 @@ pub struct CreateWindowWithTerminalOptions {
     #[serde(default)]
     #[ts(optional)]
     pub title: Option<String>,
+    /// Argv to run on *restore* instead of re-running `command`, when
+    /// the session is reopened after an editor restart. Used by
+    /// Orchestrator agent-resume: a session launched with
+    /// `claude --session-id <id>` sets `resume` to
+    /// `["claude", "--resume", "<id>"]` (or `["claude", "--continue"]`),
+    /// so a restored session rejoins its conversation rather than starting
+    /// a fresh agent. `None` keeps `command` as the restore command. The id
+    /// is a plain argv element — never interpolated into a shell string.
+    #[serde(default)]
+    #[ts(optional)]
+    pub resume: Option<Vec<String>>,
 }
 
 /// Result of `createWindowWithTerminal` — the ids of the new

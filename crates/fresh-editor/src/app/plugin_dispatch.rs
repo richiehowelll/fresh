@@ -123,7 +123,7 @@ impl Editor {
     /// owns (clipboard, the full `windows` list, the memoized config
     /// JSON cache, `user_config_raw`, and `plugin_global_state`).
     #[cfg(feature = "plugins")]
-    pub(super) fn update_plugin_state_snapshot(&mut self) {
+    pub fn update_plugin_state_snapshot(&mut self) {
         let Some(snapshot_handle) = self.plugin_manager.read().unwrap().state_snapshot_handle()
         else {
             return;
@@ -487,18 +487,10 @@ impl Editor {
                 self.handle_set_split_ratio(split_id, ratio);
             }
             PluginCommand::SetSplitLabel { split_id, label } => {
-                self.windows
-                    .get_mut(&self.active_window)
-                    .and_then(|w| w.split_manager_mut())
-                    .expect("active window must have a populated split layout")
-                    .set_label(LeafId(split_id), label);
+                self.handle_set_split_label(split_id, label);
             }
             PluginCommand::ClearSplitLabel { split_id } => {
-                self.windows
-                    .get_mut(&self.active_window)
-                    .and_then(|w| w.split_manager_mut())
-                    .expect("active window must have a populated split layout")
-                    .clear_label(split_id);
+                self.handle_clear_split_label(split_id);
             }
             PluginCommand::GetSplitByLabel { label, request_id } => {
                 self.handle_get_split_by_label(label, request_id);
@@ -645,10 +637,7 @@ impl Editor {
                 self.handle_add_plugin_config_field(plugin_name, field_name, field_schema);
             }
             PluginCommand::ReloadThemes { apply_theme } => {
-                self.reload_themes();
-                if let Some(theme_name) = apply_theme {
-                    self.apply_theme(&theme_name);
-                }
+                self.handle_reload_themes(apply_theme);
             }
             PluginCommand::RegisterGrammar {
                 language,
@@ -700,13 +689,7 @@ impl Editor {
                 self.handle_await_next_key(callback_id);
             }
             PluginCommand::SetKeyCaptureActive { active } => {
-                self.active_window_mut().key_capture_active = active;
-                if !active {
-                    // Capture window closed; any leftover queued keys
-                    // were intended for the plugin and should not now
-                    // leak into the editor's normal dispatch.
-                    self.active_window_mut().pending_key_capture_buffer.clear();
-                }
+                self.handle_set_key_capture_active(active);
             }
             PluginCommand::SetPromptSuggestions {
                 suggestions,
@@ -715,54 +698,31 @@ impl Editor {
                 self.handle_set_prompt_suggestions(suggestions, selected_index);
             }
             PluginCommand::SetPromptInputSync { sync } => {
-                if let Some(prompt) = &mut self.active_window_mut().prompt {
-                    prompt.sync_input_on_navigate = sync;
-                }
+                self.handle_set_prompt_input_sync(sync);
             }
             PluginCommand::SetPromptTitle { title } => {
-                if let Some(prompt) = &mut self.active_window_mut().prompt {
-                    prompt.title = title;
-                }
+                self.handle_set_prompt_title(title);
             }
             PluginCommand::SetPromptFooter { footer } => {
-                if let Some(prompt) = &mut self.active_window_mut().prompt {
-                    prompt.footer = footer;
-                }
+                self.handle_set_prompt_footer(footer);
             }
             PluginCommand::SetPromptToolbar { spec } => {
-                if let Some(prompt) = &mut self.active_window_mut().prompt {
-                    prompt.toolbar_widget = spec;
-                }
+                self.handle_set_prompt_toolbar(spec);
             }
             PluginCommand::ToggleOverlayToolbarWidget { key } => {
                 self.toggle_overlay_toolbar_widget(&key);
             }
             PluginCommand::SetPromptStatus { status } => {
-                if let Some(prompt) = &mut self.active_window_mut().prompt {
-                    prompt.status = status;
-                }
+                self.handle_set_prompt_status(status);
             }
             PluginCommand::SetPromptSelectedIndex { index } => {
-                if let Some(prompt) = &mut self.active_window_mut().prompt {
-                    let len = prompt.suggestions.len();
-                    if len > 0 {
-                        let clamped = (index as usize).min(len - 1);
-                        prompt.selected_suggestion = Some(clamped);
-                    }
-                }
+                self.handle_set_prompt_selected_index(index);
             }
 
             // ==================== Session lifecycle ====================
             // See docs/internal/orchestrator-sessions-design.md.
             PluginCommand::CreateWindow { root, label } => {
-                if !root.is_absolute() {
-                    tracing::warn!(
-                        "CreateWindow rejected: root must be absolute, got {:?}",
-                        root
-                    );
-                } else {
-                    let _ = self.create_window_at(root, label);
-                }
+                self.handle_create_window(root, label);
             }
             PluginCommand::CreateWindowWithTerminal {
                 root,
@@ -770,10 +730,11 @@ impl Editor {
                 cwd,
                 command,
                 title,
+                resume,
                 request_id,
             } => {
                 self.handle_create_window_with_terminal(
-                    root, label, cwd, command, title, request_id,
+                    root, label, cwd, command, title, resume, request_id,
                 );
             }
             PluginCommand::SetActiveWindow { id } => {
@@ -802,15 +763,7 @@ impl Editor {
             }
 
             PluginCommand::PreviewWindowInRect { id } => {
-                // Validate: only honour if the session exists and
-                // is not the active one (no point previewing the
-                // session whose UI is already on screen).
-                self.preview_window_id = match id {
-                    Some(sid) if sid != self.active_window && self.windows.contains_key(&sid) => {
-                        Some(sid)
-                    }
-                    _ => None,
-                };
+                self.handle_preview_window_in_rect(id);
             }
 
             // ==================== Command/Mode Registration ====================
@@ -822,26 +775,14 @@ impl Editor {
                 token_name,
                 title,
             } => {
-                if let Err(e) = self.register_status_bar_element(&plugin_name, &token_name, &title)
-                {
-                    tracing::warn!("Failed to register statusbar element: {}", e);
-                }
+                self.handle_register_status_bar_element(plugin_name, token_name, title);
             }
             PluginCommand::SetStatusBarValue {
                 buffer_id,
                 key,
                 value,
             } => {
-                if let Err(e) =
-                    self.set_status_bar_value(fresh_core::BufferId(buffer_id as usize), &key, value)
-                {
-                    // Plugins compute the value asynchronously off a lagging
-                    // state snapshot, then publish to the buffer that was
-                    // active when they started. If that buffer closed in the
-                    // meantime the value is simply discarded — an expected,
-                    // benign race, not a misuse worth warning about.
-                    tracing::debug!("Skipped statusbar value for stale buffer: {}", e);
-                }
+                self.handle_set_status_bar_value(buffer_id, key, value);
             }
             PluginCommand::UnregisterCommand { name } => {
                 self.handle_unregister_command(name);
@@ -926,9 +867,7 @@ impl Editor {
                 self.handle_start_animation_virtual_buffer(id, buffer_id, kind);
             }
             PluginCommand::CancelAnimation { id } => {
-                self.active_window_mut()
-                    .animations
-                    .cancel(crate::view::animation::AnimationId::from_raw(id));
+                self.handle_cancel_animation(id);
             }
 
             // ==================== LSP Commands ====================
@@ -974,13 +913,19 @@ impl Editor {
                 self.handle_set_authority(payload);
             }
 
-            PluginCommand::AttachRemoteAgent { payload } => {
-                self.handle_attach_remote_agent(payload);
+            PluginCommand::AttachRemoteAgent {
+                payload,
+                request_id,
+            } => {
+                self.handle_attach_remote_agent(payload, request_id);
+            }
+
+            PluginCommand::CancelRemoteAttach => {
+                self.cancel_remote_attaches();
             }
 
             PluginCommand::ClearAuthority => {
-                tracing::info!("Plugin cleared authority; restoring local");
-                self.clear_authority();
+                self.handle_clear_authority();
             }
 
             PluginCommand::SetEnv { snippet, dir } => {
@@ -1138,11 +1083,7 @@ impl Editor {
 
             // ==================== Review Diff Commands ====================
             PluginCommand::SetReviewDiffHunks { hunks } => {
-                self.active_window_mut().review_hunks = hunks;
-                tracing::debug!(
-                    "Set {} review hunks",
-                    self.active_window_mut().review_hunks.len()
-                );
+                self.handle_set_review_diff_hunks(hunks);
             }
 
             // ==================== Vi Mode Commands ====================
@@ -1291,14 +1232,10 @@ impl Editor {
                 self.flush_layout();
             }
             PluginCommand::CompositeNextHunk { buffer_id } => {
-                let split_id = self.split_manager().active_split();
-                self.active_window_mut()
-                    .composite_next_hunk(split_id, buffer_id);
+                self.handle_composite_next_hunk(buffer_id);
             }
             PluginCommand::CompositePrevHunk { buffer_id } => {
-                let split_id = self.split_manager().active_split();
-                self.active_window_mut()
-                    .composite_prev_hunk(split_id, buffer_id);
+                self.handle_composite_prev_hunk(buffer_id);
             }
 
             // ==================== Buffer Groups ====================
@@ -1545,6 +1482,153 @@ impl Editor {
         } else {
             self.handle_open_file_in_background(path);
         }
+    }
+
+    // ── Handlers extracted from the dispatch match ───────────────────────
+
+    fn handle_set_split_label(&mut self, split_id: SplitId, label: String) {
+        self.windows
+            .get_mut(&self.active_window)
+            .and_then(|w| w.split_manager_mut())
+            .expect("active window must have a populated split layout")
+            .set_label(LeafId(split_id), label);
+    }
+
+    fn handle_clear_split_label(&mut self, split_id: SplitId) {
+        self.windows
+            .get_mut(&self.active_window)
+            .and_then(|w| w.split_manager_mut())
+            .expect("active window must have a populated split layout")
+            .clear_label(split_id);
+    }
+
+    fn handle_reload_themes(&mut self, apply_theme: Option<String>) {
+        self.reload_themes();
+        if let Some(theme_name) = apply_theme {
+            self.apply_theme(&theme_name);
+        }
+    }
+
+    fn handle_set_key_capture_active(&mut self, active: bool) {
+        self.active_window_mut().key_capture_active = active;
+        if !active {
+            // Capture window closed; any leftover queued keys were intended
+            // for the plugin and should not leak into normal dispatch.
+            self.active_window_mut().pending_key_capture_buffer.clear();
+        }
+    }
+
+    fn handle_set_prompt_input_sync(&mut self, sync: bool) {
+        if let Some(prompt) = &mut self.active_window_mut().prompt {
+            prompt.sync_input_on_navigate = sync;
+        }
+    }
+
+    fn handle_set_prompt_title(&mut self, title: Vec<fresh_core::api::StyledText>) {
+        if let Some(prompt) = &mut self.active_window_mut().prompt {
+            prompt.title = title;
+        }
+    }
+
+    fn handle_set_prompt_footer(&mut self, footer: Vec<fresh_core::api::StyledText>) {
+        if let Some(prompt) = &mut self.active_window_mut().prompt {
+            prompt.footer = footer;
+        }
+    }
+
+    fn handle_set_prompt_toolbar(&mut self, spec: Option<fresh_core::api::WidgetSpec>) {
+        if let Some(prompt) = &mut self.active_window_mut().prompt {
+            prompt.toolbar_widget = spec;
+        }
+    }
+
+    fn handle_set_prompt_status(&mut self, status: String) {
+        if let Some(prompt) = &mut self.active_window_mut().prompt {
+            prompt.status = status;
+        }
+    }
+
+    fn handle_set_prompt_selected_index(&mut self, index: u32) {
+        if let Some(prompt) = &mut self.active_window_mut().prompt {
+            let len = prompt.suggestions.len();
+            if len > 0 {
+                prompt.selected_suggestion = Some((index as usize).min(len - 1));
+            }
+        }
+    }
+
+    fn handle_create_window(&mut self, root: std::path::PathBuf, label: String) {
+        if !root.is_absolute() {
+            tracing::warn!(
+                "CreateWindow rejected: root must be absolute, got {:?}",
+                root
+            );
+        } else {
+            let _ = self.create_window_at(root, label);
+        }
+    }
+
+    fn handle_preview_window_in_rect(&mut self, id: Option<fresh_core::WindowId>) {
+        // Only honour if the session exists and is not the active one
+        // (no point previewing the session whose UI is already on screen).
+        self.preview_window_id = match id {
+            Some(sid) if sid != self.active_window && self.windows.contains_key(&sid) => Some(sid),
+            _ => None,
+        };
+    }
+
+    fn handle_register_status_bar_element(
+        &mut self,
+        plugin_name: String,
+        token_name: String,
+        title: String,
+    ) {
+        if let Err(e) = self.register_status_bar_element(&plugin_name, &token_name, &title) {
+            tracing::warn!("Failed to register statusbar element: {}", e);
+        }
+    }
+
+    fn handle_set_status_bar_value(&mut self, buffer_id: u64, key: String, value: String) {
+        if let Err(e) =
+            self.set_status_bar_value(fresh_core::BufferId(buffer_id as usize), &key, value)
+        {
+            // Plugins compute asynchronously off a lagging state snapshot, so
+            // the target buffer may have closed — an expected, benign race.
+            tracing::debug!("Skipped statusbar value for stale buffer: {}", e);
+        }
+    }
+
+    fn handle_cancel_animation(&mut self, id: u64) {
+        self.active_window_mut()
+            .animations
+            .cancel(crate::view::animation::AnimationId::from_raw(id));
+    }
+
+    fn handle_clear_authority(&mut self) {
+        tracing::info!("Plugin cleared authority; restoring local");
+        self.clear_authority();
+    }
+
+    fn handle_set_review_diff_hunks(&mut self, hunks: Vec<fresh_core::api::ReviewHunk>) {
+        self.active_window_mut().review_hunks = hunks;
+        tracing::debug!(
+            "Set {} review hunks",
+            self.active_window_mut().review_hunks.len()
+        );
+    }
+
+    fn handle_composite_next_hunk(&mut self, buffer_id: fresh_core::BufferId) {
+        // Inner group leaf: the Review Diff composite lives in the focused
+        // group leaf, not the outer active split (see `handle_composite_action`).
+        let split_id = self.active_window().effective_active_pair().0;
+        self.active_window_mut()
+            .composite_next_hunk(split_id, buffer_id);
+    }
+
+    fn handle_composite_prev_hunk(&mut self, buffer_id: fresh_core::BufferId) {
+        let split_id = self.active_window().effective_active_pair().0;
+        self.active_window_mut()
+            .composite_prev_hunk(split_id, buffer_id);
     }
 
     // ── Virtual-buffer display configuration ────────────────────────────
@@ -2561,14 +2645,26 @@ impl Editor {
         hidden_from_tabs: bool,
         request_id: Option<u64>,
     ) {
-        let buffer_id =
+        // Hidden-from-tabs buffers (e.g. composite source panes) must NOT be
+        // attached to the active split or made the active buffer: doing so
+        // pollutes the main tab bar and, when they're later closed, leaves
+        // auto-created "[No Name]" tabs behind. Create them detached.
+        let buffer_id = if hidden_from_tabs {
+            self.active_window_mut().create_virtual_buffer_detached(
+                name.clone(),
+                mode.clone(),
+                read_only,
+            )
+        } else {
             self.active_window_mut()
-                .create_virtual_buffer(name.clone(), mode.clone(), read_only);
+                .create_virtual_buffer(name.clone(), mode.clone(), read_only)
+        };
         tracing::info!(
-            "Created virtual buffer '{}' with mode '{}' (id={:?})",
+            "Created virtual buffer '{}' with mode '{}' (id={:?}, detached={})",
             name,
             mode,
-            buffer_id
+            buffer_id,
+            hidden_from_tabs
         );
 
         // TODO: show_line_numbers is duplicated between EditorState.margins and
@@ -2577,31 +2673,31 @@ impl Editor {
         // setting here effectively write-only. Consider removing the margin call
         // and only setting BufferViewState.show_line_numbers.
         self.configure_vbuf_display(buffer_id, show_line_numbers, show_cursors, editing_disabled);
-        let active_split = self.split_manager().active_split();
-        if let Some(view_state) = self
-            .windows
-            .get_mut(&self.active_window)
-            .and_then(|w| w.split_view_states_mut())
-            .expect("active window must have a populated split layout")
-            .get_mut(&active_split)
-        {
-            view_state.ensure_buffer_state(buffer_id).show_line_numbers = show_line_numbers;
-        }
-
-        // Apply hidden_from_tabs to buffer metadata
-        if hidden_from_tabs {
-            if let Some(meta) = self.active_window_mut().buffer_metadata.get_mut(&buffer_id) {
-                meta.hidden_from_tabs = true;
+        if !hidden_from_tabs {
+            let active_split = self.split_manager().active_split();
+            if let Some(view_state) = self
+                .windows
+                .get_mut(&self.active_window)
+                .and_then(|w| w.split_view_states_mut())
+                .expect("active window must have a populated split layout")
+                .get_mut(&active_split)
+            {
+                view_state.ensure_buffer_state(buffer_id).show_line_numbers = show_line_numbers;
             }
+        } else if let Some(meta) = self.active_window_mut().buffer_metadata.get_mut(&buffer_id) {
+            meta.hidden_from_tabs = true;
         }
 
         // Now set the content
         match self.set_virtual_buffer_content(buffer_id, entries) {
             Ok(()) => {
                 tracing::debug!("Set virtual buffer content for {:?}", buffer_id);
-                // Switch to the new buffer to display it
-                self.set_active_buffer(buffer_id);
-                tracing::debug!("Switched to virtual buffer {:?}", buffer_id);
+                // Switch to the new buffer to display it — but only when it's
+                // attached (a detached hidden buffer must not steal the view).
+                if !hidden_from_tabs {
+                    self.set_active_buffer(buffer_id);
+                    tracing::debug!("Switched to virtual buffer {:?}", buffer_id);
+                }
 
                 // Send response if request_id is present
                 if let Some(req_id) = request_id {
@@ -3066,6 +3162,7 @@ impl Editor {
         self.refresh_lsp_status_popup_if_open();
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn handle_create_window_with_terminal(
         &mut self,
         root: std::path::PathBuf,
@@ -3073,6 +3170,7 @@ impl Editor {
         cwd: Option<String>,
         command: Option<Vec<String>>,
         title: Option<String>,
+        resume: Option<Vec<String>>,
         request_id: u64,
     ) {
         let callback_id = JsCallbackId::from(request_id);
@@ -3089,7 +3187,7 @@ impl Editor {
             return;
         }
         let cwd_buf = cwd.map(std::path::PathBuf::from);
-        match self.create_window_with_terminal(root, label, cwd_buf, command, title) {
+        match self.create_window_with_terminal(root, label, cwd_buf, command, title, resume) {
             Ok((window_id, terminal_id, buffer_id)) => {
                 let api_result = fresh_core::api::SessionWithTerminalResult {
                     window_id: window_id.0,
@@ -3386,7 +3484,7 @@ impl Editor {
         }
     }
 
-    fn handle_attach_remote_agent(&mut self, payload: serde_json::Value) {
+    fn handle_attach_remote_agent(&mut self, payload: serde_json::Value, request_id: u64) {
         // Opaque at the fresh-core boundary; the concrete schema lives in
         // services::authority so core stays backend-agnostic.
         let spec =
@@ -3394,7 +3492,7 @@ impl Editor {
                 Ok(spec) => spec,
                 Err(e) => {
                     tracing::warn!("attachRemoteAgent: invalid payload: {}", e);
-                    self.set_status_message(format!("attachRemoteAgent rejected: {e}"));
+                    self.reject_remote_attach(request_id, format!("invalid attach spec: {e}"));
                     return;
                 }
             };
@@ -3404,9 +3502,17 @@ impl Editor {
         let runtime = self.tokio_runtime.clone();
         let sender = self.async_bridge.as_ref().map(|b| b.sender());
         let (Some(runtime), Some(sender)) = (runtime, sender) else {
-            self.set_status_message("attachRemoteAgent: async runtime not available".to_string());
+            self.reject_remote_attach(request_id, "async runtime not available".to_string());
             return;
         };
+
+        // Track this connect as in-flight so a plugin can cancel it (the
+        // New-Session dialog's Cancel) before it resolves. The cancel sender is
+        // handed to the connect via its `select!`; signalling it tears down the
+        // in-flight carrier child.
+        self.remote_attach_inflight.insert(request_id);
+        let (cancel_tx, cancel_rx) = tokio::sync::oneshot::channel::<()>();
+        self.remote_attach_cancels.insert(request_id, cancel_tx);
 
         // Window-mode opts captured before `spec` is consumed — when `window`
         // is set the main loop spawns a born-attached new window instead of
@@ -3446,7 +3552,11 @@ impl Editor {
                 self.set_status_message(format!("Connecting to {label}…"));
                 runtime.spawn(async move {
                     let outcome = crate::services::authority::connect_kube_authority(
-                        target, base_env, trust, env,
+                        target,
+                        base_env,
+                        trust,
+                        env,
+                        Some(cancel_rx),
                     )
                     .await;
                     let msg = match outcome {
@@ -3456,10 +3566,12 @@ impl Editor {
                                 keepalive: Box::new(keepalive),
                                 working_dir: workspace,
                                 mode,
+                                request_id,
                             },
                         ),
                         Err(e) => AsyncMessage::RemoteAttachFailed {
                             error: e.to_string(),
+                            request_id,
                         },
                     };
                     #[allow(clippy::let_underscore_must_use)]
@@ -3472,17 +3584,21 @@ impl Editor {
                 port,
                 identity_file,
                 remote_path,
+                extra_args,
             } => {
                 let _ = base_env; // SSH probes its own env on the remote host.
                 let params = crate::services::remote::ConnectionParams {
-                    user: user.clone(),
+                    user: user.clone().filter(|u| !u.is_empty()),
                     host: host.clone(),
                     port,
                     identity_file: identity_file.map(std::path::PathBuf::from),
+                    extra_args,
                 };
+                // Label: `user@host` when a user was given, else bare `host`.
+                let target = params.ssh_target();
                 let label = match port {
-                    Some(p) => format!("ssh:{user}@{host}:{p}"),
-                    None => format!("ssh:{user}@{host}"),
+                    Some(p) => format!("ssh:{target}:{p}"),
+                    None => format!("ssh:{target}"),
                 };
                 let workspace = remote_path.clone().map(std::path::PathBuf::from);
                 let mode = mode_for(&label);
@@ -3493,6 +3609,7 @@ impl Editor {
                         remote_path,
                         trust,
                         env,
+                        Some(cancel_rx),
                     )
                     .await;
                     let msg = match outcome {
@@ -3502,10 +3619,12 @@ impl Editor {
                                 keepalive: Box::new(keepalive),
                                 working_dir: workspace,
                                 mode,
+                                request_id,
                             },
                         ),
                         Err(e) => AsyncMessage::RemoteAttachFailed {
                             error: e.to_string(),
+                            request_id,
                         },
                     };
                     #[allow(clippy::let_underscore_must_use)]
@@ -4246,6 +4365,20 @@ impl Editor {
                 fwp.placement = super::PanelPlacement::Centered;
                 fwp.focused = true;
                 true
+            }
+            // Place the panel as an unobtrusive content-sized popup anchored
+            // at a screen cell (a right-click context menu). The (x, y) cell
+            // is packed into the single `f64` arg as `y << 16 | x` — both fit
+            // a u16 and the sum is exact in `f64`. No chrome-geometry change
+            // (the dock/editor layout is untouched), so no relayout.
+            "anchor" => {
+                let packed = arg.max(0.0) as u64;
+                let x = (packed & 0xFFFF) as u16;
+                let y = ((packed >> 16) & 0xFFFF) as u16;
+                fwp.placement = super::PanelPlacement::Anchored { x, y };
+                fwp.focused = true;
+                fwp.fullscreen = false;
+                false
             }
             "focus" => {
                 fwp.focused = true;
@@ -5050,6 +5183,9 @@ impl Window {
                 }
             }
         }
+
+        // Update active search state so plugins can query it via hasActiveSearch()
+        snapshot.has_active_search = self.search_state.is_some();
     }
 }
 

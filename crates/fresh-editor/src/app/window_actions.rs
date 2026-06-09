@@ -31,7 +31,15 @@ impl crate::app::Editor {
             theme_cache: std::sync::Arc::clone(&self.theme_cache),
             keybindings: std::sync::Arc::clone(&self.keybindings),
             command_registry: std::sync::Arc::clone(&self.command_registry),
-            fs_manager: std::sync::Arc::clone(&self.fs_manager),
+            // Derive the window's fs_manager from the *same* authority we hand
+            // it below, so directory listings (the file explorer) ride the
+            // window's filesystem — local or remote — instead of a stale,
+            // boot-time local one. A born-attached SSH/k8s window otherwise
+            // showed the local machine in the explorer while its terminal ran
+            // remote, because the cached fs_manager never tracked the authority.
+            fs_manager: std::sync::Arc::new(crate::services::fs::FsManager::new(
+                std::sync::Arc::clone(&self.authority.filesystem),
+            )),
             local_filesystem: std::sync::Arc::clone(&self.local_filesystem),
             buffer_id_alloc: self.buffer_id_alloc.clone(),
             authority: self.authority.clone(),
@@ -142,6 +150,7 @@ impl crate::app::Editor {
     ///
     /// `root` must be absolute; the plugin-command dispatcher
     /// validates this before reaching here.
+    #[allow(clippy::too_many_arguments)]
     pub fn create_window_with_terminal(
         &mut self,
         root: PathBuf,
@@ -149,6 +158,7 @@ impl crate::app::Editor {
         cwd: Option<PathBuf>,
         command: Option<Vec<String>>,
         title: Option<String>,
+        resume: Option<Vec<String>>,
     ) -> Result<(WindowId, fresh_core::TerminalId, fresh_core::BufferId), String> {
         let id = WindowId(self.next_window_id);
         self.next_window_id += 1;
@@ -171,6 +181,11 @@ impl crate::app::Editor {
         let previous_id = self.active_window;
         self.active_window = id;
 
+        // The argv to re-run if this session is restored. `None` (plain
+        // shell) is recorded as an empty vec: a present entry — even empty —
+        // marks this as a restorable *session* terminal (re-spawn it on
+        // restore), distinct from a throwaway ephemeral build/exec shell.
+        let restore_command = command.clone().unwrap_or_default();
         let spawn_result = {
             let target = self
                 .windows
@@ -200,6 +215,32 @@ impl crate::app::Editor {
                 return Err(e);
             }
         };
+
+        // Mark the freshly-spawned agent terminal restorable so workspace
+        // capture persists it (with its command) and a later launch
+        // re-runs it, instead of the session coming back as a blank pane.
+        // An explicit `resume` argv (agent-resume) supersedes the launch
+        // command on restore — see `restore_terminal_from_workspace`.
+        if let Some(target) = self.windows.get_mut(&id) {
+            target
+                .terminal_commands
+                .insert(terminal_id, restore_command);
+            if let Some(resume_argv) = resume.filter(|a| !a.is_empty()) {
+                target
+                    .terminal_resume_commands
+                    .insert(terminal_id, resume_argv);
+            }
+        }
+
+        // The switch has now committed (the spawn succeeded and the active
+        // pointer stays on the new window). This path wrote `active_window`
+        // directly above, bypassing `set_active_window` — so mirror its
+        // guard here, or a panel-scoped mode set on the window we switched
+        // away from (e.g. the New-Session form's `orchestrator-new-form`,
+        // still mounted during a born-attached SSH/K8s attach) is left
+        // stranded and silently swallows all of that window's buffer input.
+        // See #2237 / #2234 item 4.
+        self.clear_panel_scoped_mode_on_switch_away(previous_id);
 
         // Register the leader pid with the new window's
         // process_groups so window-level signal operations reach
@@ -262,6 +303,40 @@ impl crate::app::Editor {
         Ok((id, terminal_id, buffer_id))
     }
 
+    /// Clear a floating-panel-scoped editor mode on the window we are
+    /// switching *away* from.
+    ///
+    /// A plugin-defined editor mode (`editor.setEditorMode`) tied to a mounted
+    /// floating widget panel — the Orchestrator picker (`orchestrator-open`) or
+    /// new-session form (`orchestrator-new-form`) — is transient UI state that
+    /// belongs to the *panel*, not to the window it was opened over.
+    /// `setEditorMode` writes to whatever window is active when the plugin
+    /// calls it, so a plugin that switches the active window while its panel is
+    /// still mounted (the orchestrator "dive": `setActiveWindow(target)` first,
+    /// then `closeOpenDialog()` / `closeForm()` which runs
+    /// `setEditorMode(null)`) lands the clear on the *incoming* window and
+    /// leaves the *outgoing* one stuck in the panel's mode. That stuck mode
+    /// stays masked while the window sits in terminal mode, then silently
+    /// swallows every printable key the moment the user leaves terminal mode
+    /// (e.g. opens a file via quick-open) — the buffer ignores all keyboard
+    /// input until the user switches sessions.
+    ///
+    /// Both window-switch paths must call this before moving the active
+    /// pointer: the ordinary `set_active_window` dive *and* the born-attached
+    /// remote session creation (`create_window_with_terminal`), which writes
+    /// the active pointer directly and so never reaches `set_active_window`'s
+    /// own guard. See #2237 / #2234 item 4.
+    ///
+    /// vi-mode and other persistent per-window modes are unaffected: they never
+    /// have a floating panel mounted during a window switch.
+    fn clear_panel_scoped_mode_on_switch_away(&mut self, previous_id: WindowId) {
+        if self.floating_widget_panel.is_some() {
+            if let Some(win) = self.windows.get_mut(&previous_id) {
+                win.editor_mode = None;
+            }
+        }
+    }
+
     /// Switch the active window to `id`.
     ///
     /// Pointer write: every per-window field
@@ -292,31 +367,10 @@ impl crate::app::Editor {
         // the `authority_changed` hook.
         let previous_authority_label = self.authority.display_label.clone();
 
-        // A plugin-defined editor mode (`editor.setEditorMode`) tied to a
-        // mounted floating widget panel — the Orchestrator picker
-        // (`orchestrator-open`) or new-session form (`orchestrator-new-form`)
-        // — is transient UI state that belongs to the *panel*, not to the
-        // window it was opened over. `setEditorMode` writes to whatever
-        // window is active when the plugin calls it, so a plugin that
-        // switches the active window while its panel is still mounted
-        // (the orchestrator "dive": `setActiveWindow(target)` first, then
-        // `closeOpenDialog()` which runs `setEditorMode(null)`) lands the
-        // clear on the *incoming* window and leaves the *outgoing* one
-        // stuck in the panel's mode. That stuck mode stays masked while the
-        // window sits in terminal mode, then silently swallows every
-        // printable key the moment the user leaves terminal mode (e.g.
-        // opens a file via quick-open) — the buffer ignores all keyboard
-        // input until the user switches sessions back and forth (which
-        // re-dives into the window and finally clears it). Clear any
-        // panel-scoped mode on the outgoing window here so it can never
-        // outlive the switch. vi-mode and other persistent per-window modes
-        // are unaffected: they never have a floating panel mounted during a
-        // window switch.
-        if self.floating_widget_panel.is_some() {
-            if let Some(win) = self.windows.get_mut(&previous_id) {
-                win.editor_mode = None;
-            }
-        }
+        // Clear any panel-scoped editor mode on the window we're leaving so
+        // it can never outlive the switch (see
+        // `clear_panel_scoped_mode_on_switch_away`).
+        self.clear_panel_scoped_mode_on_switch_away(previous_id);
 
         // Lazy materialization: if this window's saved workspace hasn't
         // been restored yet, restore it now (before seeding) so the
@@ -638,7 +692,8 @@ impl crate::app::Editor {
         // The previous (local / other-remote) window keeps its own
         // `resources.authority`; Gap A restores it on switch-back.
         let saved_authority = std::mem::replace(&mut self.authority, authority);
-        match self.create_window_with_terminal(root.clone(), label, Some(root), command, None) {
+        match self.create_window_with_terminal(root.clone(), label, Some(root), command, None, None)
+        {
             Ok((window_id, _terminal, _buffer)) => {
                 self.session_keepalives.insert(window_id, keepalive);
                 // `create_window_with_terminal` writes the active pointer

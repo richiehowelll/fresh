@@ -975,24 +975,88 @@ impl Editor {
     /// nothing to gate. Called from every editor-startup path (in-process run
     /// and the session server) so the prompt fires regardless of launch mode.
     pub fn maybe_prompt_workspace_trust(&mut self) {
-        // WIP: the auto trust prompt is temporarily disabled and undecided
-        // workspaces default to Trusted (full execution), so the editor
-        // behaves as it did before Workspace Trust landed. This unblocks
-        // merging the surrounding work while the trust UX is redesigned around
-        // a sandboxed-execution model — see
-        // `docs/internal/workspace-trust-sandbox-design.md`. A decision the
-        // user explicitly recorded is still honored; only the prompt-on-open
-        // is suppressed. The manual `Workspace: Set Trust Level` command and
-        // the enforcement core are untouched, so this is a one-line revert.
+        // Phase 1 of the trust+env+devcontainer UX plan (see
+        // `docs/internal/trust-env-devcontainer-ux-plan.md`): when the
+        // workspace is undecided AND has executable content, two paths:
+        //
+        // - The folder has env-shell markers (`.envrc`/`mise.toml`/
+        //   `.tool-versions`) — start as Restricted and let the
+        //   env-manager plugin's combined "Trust this folder and
+        //   activate?" popup do the asking, because that prompt is the
+        //   most concrete framing of the decision (it names the
+        //   specific env). The user's "Trust & activate" choice
+        //   dispatches `workspace_trust_trust`, which records the
+        //   decision and raises the level to Trusted.
+        //
+        // - Any other executable content (project manifests, devcontainer-
+        //   only, .NET solution/project files, …) — fire the core trust
+        //   modal here, with concrete framing: the popup names the
+        //   *specific* markers that triggered it (Cargo.toml, build.rs,
+        //   App.sln, devcontainer.json…) rather than the abstract
+        //   "this project can run code on your machine." Start as
+        //   Restricted while waiting for the user to choose.
+        //
+        // A decision the user explicitly recorded is always honored — this
+        // branch only fires for undecided projects.
         let store = crate::services::workspace_trust::TrustStore::for_project_dir(
             &self.dir_context.project_state_dir(self.working_dir()),
         );
         if store.is_decided() {
             return; // respect a decision the user already recorded
         }
+
+        let markers =
+            crate::services::workspace_trust::executable_content_markers(self.working_dir());
+
+        // Categorize the markers so we can route to the right surface.
+        // Path-only envs (`.venv`, `venv`) are not modeled as a
+        // "would-run-shell" question — activation is a `PATH` prepend,
+        // not arbitrary user shell. The North Star treats them as
+        // "Cheap actions don't ask": auto-activate silently, undo via
+        // status pill. So path-only env *alone* doesn't trigger any
+        // prompt; we hand the workspace to env-manager as Trusted.
+        let path_only_env_markers = [".venv", "venv"];
+        let env_shell_markers = [".envrc", "mise.toml", ".mise.toml", ".tool-versions"];
+        let only_path_only_env = !markers.is_empty()
+            && markers
+                .iter()
+                .all(|m| path_only_env_markers.contains(&m.as_str()));
+        let has_env_shell = markers
+            .iter()
+            .any(|m| env_shell_markers.contains(&m.as_str()));
+
+        if markers.is_empty() || only_path_only_env {
+            // Nothing genuinely needs gating. Default to Trusted so the
+            // restricted chip doesn't appear, env-manager auto-activates
+            // any path-only env silently, and the user isn't blocked on
+            // a question that has no real downside. Persist this — it's
+            // the same decision we'd record if the user had explicitly
+            // confirmed.
+            self.authority
+                .workspace_trust
+                .set_level(crate::services::workspace_trust::TrustLevel::Trusted);
+            return;
+        }
+
+        // For env-shell and other executable content, seed Restricted
+        // *in memory only* — `set_level_transient` does not write to
+        // disk. The on-disk store stays undecided until the user picks
+        // a concrete option in the surfaced prompt. That preserves the
+        // contract: cancelling (quit) leaves the project undecided so
+        // the prompt fires again next time, while any deliberate
+        // choice (env-manager's "Trust & activate" / "Never here" or
+        // the core modal's three radios) writes the decision through
+        // via `set_level`.
         self.authority
             .workspace_trust
-            .set_level(crate::services::workspace_trust::TrustLevel::Trusted);
+            .set_level_transient(crate::services::workspace_trust::TrustLevel::Restricted);
+
+        if !has_env_shell {
+            // Non-cancellable on open: the choice has to be made, but
+            // any concrete option resolves it. (`Esc` is inert on the
+            // forced-choice variant; user must pick a row.)
+            self.show_workspace_trust_popup(false);
+        }
     }
 
     /// Show the workspace-trust prompt: a centered list asking how this

@@ -86,6 +86,41 @@
           70,
           70
         ],
+        "bracket_match_fg": [
+          255,
+          215,
+          0
+        ],
+        "bracket_rainbow_1": [
+          255,
+          215,
+          0
+        ],
+        "bracket_rainbow_2": [
+          218,
+          112,
+          214
+        ],
+        "bracket_rainbow_3": [
+          50,
+          205,
+          50
+        ],
+        "bracket_rainbow_4": [
+          30,
+          144,
+          255
+        ],
+        "bracket_rainbow_5": [
+          255,
+          127,
+          80
+        ],
+        "bracket_rainbow_6": [
+          147,
+          112,
+          219
+        ],
         "after_eof_bg": null
       }
     },
@@ -182,6 +217,8 @@
         "status_bar_bg": "DarkGray",
         "status_palette_fg": null,
         "status_palette_bg": null,
+        "status_separator_fg": null,
+        "status_separator_bg": null,
         "status_lsp_on_fg": null,
         "status_lsp_on_bg": null,
         "status_lsp_actionable_fg": null,
@@ -640,6 +677,69 @@
             70
           ]
         },
+        "bracket_match_fg": {
+          "description": "Bracket match highlight color (used when rainbow is disabled)",
+          "$ref": "#/$defs/ColorDef",
+          "default": [
+            255,
+            215,
+            0
+          ]
+        },
+        "bracket_rainbow_1": {
+          "description": "Rainbow bracket color (nesting level 1)",
+          "$ref": "#/$defs/ColorDef",
+          "default": [
+            255,
+            215,
+            0
+          ]
+        },
+        "bracket_rainbow_2": {
+          "description": "Rainbow bracket color (nesting level 2)",
+          "$ref": "#/$defs/ColorDef",
+          "default": [
+            218,
+            112,
+            214
+          ]
+        },
+        "bracket_rainbow_3": {
+          "description": "Rainbow bracket color (nesting level 3)",
+          "$ref": "#/$defs/ColorDef",
+          "default": [
+            50,
+            205,
+            50
+          ]
+        },
+        "bracket_rainbow_4": {
+          "description": "Rainbow bracket color (nesting level 4)",
+          "$ref": "#/$defs/ColorDef",
+          "default": [
+            30,
+            144,
+            255
+          ]
+        },
+        "bracket_rainbow_5": {
+          "description": "Rainbow bracket color (nesting level 5)",
+          "$ref": "#/$defs/ColorDef",
+          "default": [
+            255,
+            127,
+            80
+          ]
+        },
+        "bracket_rainbow_6": {
+          "description": "Rainbow bracket color (nesting level 6)",
+          "$ref": "#/$defs/ColorDef",
+          "default": [
+            147,
+            112,
+            219
+          ]
+        },
         "after_eof_bg": {
           "description": "Background color for lines after end-of-file (optional override).\nWhen not set, computed as a slightly contrasting shade of `bg`\n(lighter for dark themes, darker for light themes) to give post-EOF\nrows a subtle visual separation from the buffer content.",
           "anyOf": [
@@ -893,6 +993,30 @@
         },
         "status_palette_bg": {
           "description": "Command palette shortcut hint background in status bar (falls back to status_bar_bg)",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ColorDef"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "status_separator_fg": {
+          "description": "Status bar separator glyph text color (falls back to status_bar_fg)",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ColorDef"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "status_separator_bg": {
+          "description": "Status bar separator glyph background (falls back to status_bar_bg)",
           "anyOf": [
             {
               "$ref": "#/$defs/ColorDef"

@@ -226,8 +226,11 @@ type PathTranslationSpec = {
 };"#;
 
 /// Hand-written declaration for `RemoteAgentSpec` (the
-/// `editor.attachRemoteAgent(...)` payload). Keep in sync with
-/// `crates/fresh-editor/src/services/authority/mod.rs::RemoteAgentSpec`.
+/// `editor.attachRemoteAgent(...)` payload), covering both transports
+/// (`kubectl-exec` and `ssh`) and the window-mode fields. Keep in sync with
+/// `crates/fresh-editor/src/services/authority/mod.rs`'s `RemoteAgentSpec` /
+/// `RemoteTransportSpec` — this crate must not depend on `fresh-editor`, so the
+/// shape is mirrored by hand.
 const REMOTE_AGENT_SPEC_DECL: &str = r#"type RemoteAgentTransport = {
   kind: "kubectl-exec";
   /** kubeconfig context to select (`--context`); omit for the current one. */
@@ -238,6 +241,19 @@ const REMOTE_AGENT_SPEC_DECL: &str = r#"type RemoteAgentTransport = {
   container?: string | null;
   /** Pod-side workspace root the terminal opens in. */
   workspace?: string | null;
+} | {
+  kind: "ssh";
+  /** Login user. Optional — omit for `host` / `ssh://host`, letting ssh pick
+  * the user from its own config or the current local user. */
+  user?: string | null;
+  host: string;
+  port?: number | null;
+  identity_file?: string | null;
+  /** Remote directory to root the session at. */
+  remote_path?: string | null;
+  /** Extra `ssh` arguments (e.g. `-J jump`, `-o ProxyCommand=…`) applied to
+  * every ssh invocation for this session. */
+  extra_args?: string[];
 };
 
 type RemoteAgentSpec = {
@@ -247,6 +263,17 @@ type RemoteAgentSpec = {
   * binary-presence probes. Omit when no probe was run.
   */
   base_env?: [string, string][];
+  /**
+  * When true, attach as a NEW window (born-attached, coexisting with the
+  * existing windows) instead of the default global restart that replaces the
+  * whole editor's authority. The Orchestrator sets this so a cloud session is
+  * a real session row beside local ones.
+  */
+  window?: boolean;
+  /** Window label (window mode only). Omit to use the transport's display. */
+  label?: string;
+  /** Optional agent argv for the new window's seed terminal (window mode). */
+  command?: string[];
 };"#;
 
 /// Hand-written declaration for `RemoteIndicatorStatePayload`. Keep in
@@ -604,6 +631,13 @@ interface HookEventMap {
 
   // ── UI events ────────────────────────────────────────────────────────────
   action_popup_result: { popup_id: string; action_id: string };
+  /**
+   * User clicked a plugin-registered status-bar token. Subscribers
+   * filter by `plugin_name` + `token_name`. Use this to re-open a
+   * deferred prompt or surface the relevant settings UI for whatever
+   * the token represents (e.g. trust chip → trust-elevation popup).
+   */
+  status_bar_token_clicked: { plugin_name: string; token_name: string };
   process_output: { process_id: number; data: string };
   language_changed: { buffer_id: number; language: string };
   theme_inspect_key: { theme_name: string; key: string };

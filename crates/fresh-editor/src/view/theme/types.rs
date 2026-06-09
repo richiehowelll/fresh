@@ -723,6 +723,12 @@ pub struct UiColors {
     /// Command palette shortcut hint background in status bar (falls back to status_bar_bg)
     #[serde(default)]
     pub status_palette_bg: Option<ColorDef>,
+    /// Status bar separator glyph text color (falls back to status_bar_fg)
+    #[serde(default)]
+    pub status_separator_fg: Option<ColorDef>,
+    /// Status bar separator glyph background (falls back to status_bar_bg)
+    #[serde(default)]
+    pub status_separator_bg: Option<ColorDef>,
     /// Status bar LSP indicator text color when LSP is running (falls back to status_bar_fg)
     #[serde(default)]
     pub status_lsp_on_fg: Option<ColorDef>,
@@ -1364,6 +1370,9 @@ pub struct Theme {
     /// Status bar palette shortcut hint colors (default: same as status bar)
     pub status_palette_fg: Color,
     pub status_palette_bg: Color,
+    /// Status bar separator glyph colors (default: same as status bar)
+    pub status_separator_fg: Color,
+    pub status_separator_bg: Color,
     /// Status bar LSP indicator colors when running (default: same as status bar)
     pub status_lsp_on_fg: Color,
     pub status_lsp_on_bg: Color,
@@ -1576,6 +1585,18 @@ impl From<ThemeFile> for Theme {
                 .clone()
                 .map(|c| c.into())
                 .unwrap_or_else(|| file.ui.status_bar_bg.clone().into()),
+            status_separator_fg: file
+                .ui
+                .status_separator_fg
+                .clone()
+                .map(|c| c.into())
+                .unwrap_or_else(|| file.ui.status_bar_fg.clone().into()),
+            status_separator_bg: file
+                .ui
+                .status_separator_bg
+                .clone()
+                .map(|c| c.into())
+                .unwrap_or_else(|| file.ui.status_bar_bg.clone().into()),
             status_lsp_on_fg: file
                 .ui
                 .status_lsp_on_fg
@@ -1776,6 +1797,8 @@ impl From<Theme> for ThemeFile {
                 status_bar_bg: theme.status_bar_bg.into(),
                 status_palette_fg: Some(theme.status_palette_fg.into()),
                 status_palette_bg: Some(theme.status_palette_bg.into()),
+                status_separator_fg: Some(theme.status_separator_fg.into()),
+                status_separator_bg: Some(theme.status_separator_bg.into()),
                 status_lsp_on_fg: Some(theme.status_lsp_on_fg.into()),
                 status_lsp_on_bg: Some(theme.status_lsp_on_bg.into()),
                 status_lsp_actionable_fg: Some(theme.status_lsp_actionable_fg.into()),
@@ -2117,6 +2140,8 @@ impl Theme {
                 "status_lsp_on_fg" => Some(self.status_lsp_on_fg),
                 "status_palette_bg" => Some(self.status_palette_bg),
                 "status_palette_fg" => Some(self.status_palette_fg),
+                "status_separator_bg" => Some(self.status_separator_bg),
+                "status_separator_fg" => Some(self.status_separator_fg),
                 "status_warning_indicator_bg" => Some(self.status_warning_indicator_bg),
                 "status_warning_indicator_fg" => Some(self.status_warning_indicator_fg),
                 "status_warning_indicator_hover_bg" => Some(self.status_warning_indicator_hover_bg),
@@ -2225,6 +2250,8 @@ impl Theme {
                 "status_bar_bg" => Some(&mut self.status_bar_bg),
                 "status_palette_fg" => Some(&mut self.status_palette_fg),
                 "status_palette_bg" => Some(&mut self.status_palette_bg),
+                "status_separator_fg" => Some(&mut self.status_separator_fg),
+                "status_separator_bg" => Some(&mut self.status_separator_bg),
                 "status_lsp_on_fg" => Some(&mut self.status_lsp_on_fg),
                 "status_lsp_on_bg" => Some(&mut self.status_lsp_on_bg),
                 "status_lsp_actionable_fg" => Some(&mut self.status_lsp_actionable_fg),

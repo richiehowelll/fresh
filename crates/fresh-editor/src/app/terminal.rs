@@ -1381,6 +1381,12 @@ impl Window {
             for row in 0..rows {
                 content.push(state.get_line(row));
             }
+            // Ctrl+hover underline: highlight the link span when it's in this
+            // terminal buffer.
+            let link_highlight = self
+                .terminal_link_hover
+                .as_ref()
+                .and_then(|h| (h.buffer_id == *buffer_id).then(|| (h.row, h.cols.clone())));
             frame.render_widget(ratatui::widgets::Clear, *content_rect);
             let theme = self.resources.theme.read().unwrap();
             render::render_terminal_content(
@@ -1391,6 +1397,7 @@ impl Window {
                 frame.buffer_mut(),
                 theme.terminal_fg,
                 theme.terminal_bg,
+                link_highlight,
             );
         }
     }
@@ -1501,6 +1508,7 @@ pub mod render {
     use ratatui::style::{Color, Modifier, Style};
 
     /// Render terminal content to a ratatui buffer
+    #[allow(clippy::too_many_arguments)]
     pub fn render_terminal_content(
         content: &[Vec<TerminalCell>],
         cursor_pos: (u16, u16),
@@ -1509,6 +1517,7 @@ pub mod render {
         buf: &mut Buffer,
         default_fg: Color,
         default_bg: Color,
+        link_highlight: Option<(u16, std::ops::Range<usize>)>,
     ) {
         // Fill the rendered area with the theme's terminal bg first so any
         // cells past the PTY grid (e.g. transiently smaller than the rect
@@ -1556,6 +1565,14 @@ pub mod render {
                     style = style.add_modifier(Modifier::REVERSED);
                 }
 
+                // Ctrl+hover link highlight: underline the link span so it
+                // reads as clickable.
+                if let Some((link_row, ref cols)) = link_highlight {
+                    if row_idx as u16 == link_row && cols.contains(&col_idx) {
+                        style = style.add_modifier(Modifier::UNDERLINED);
+                    }
+                }
+
                 // Check if this is the cursor position
                 if cursor_visible
                     && row_idx as u16 == cursor_pos.1
@@ -1596,6 +1613,7 @@ pub mod render {
                 &mut buf,
                 default_fg,
                 default_bg,
+                None,
             );
 
             for y in area.top()..area.bottom() {
@@ -1606,6 +1624,43 @@ pub mod render {
                         "cell ({x}, {y}) bg should be the theme terminal_bg",
                     );
                 }
+            }
+        }
+
+        /// The Ctrl+hover link highlight underlines exactly the cells in the
+        /// given (row, col-range) span and leaves the rest untouched.
+        #[test]
+        fn link_highlight_underlines_only_its_span() {
+            // One 6-wide row of text "abcdef".
+            let area = Rect::new(0, 0, 6, 1);
+            let mut buf = Buffer::empty(area);
+            let row: Vec<TerminalCell> = "abcdef"
+                .chars()
+                .map(|c| TerminalCell {
+                    c,
+                    ..Default::default()
+                })
+                .collect();
+            let content = vec![row];
+
+            render_terminal_content(
+                &content,
+                (0, 0),
+                false,
+                area,
+                &mut buf,
+                Color::White,
+                Color::Black,
+                Some((0, 2..5)), // underline columns 2,3,4
+            );
+
+            for x in 0..area.width {
+                let underlined = buf[(x, 0)].modifier.contains(Modifier::UNDERLINED);
+                let expected = (2..5).contains(&(x as usize));
+                assert_eq!(
+                    underlined, expected,
+                    "cell col {x} underline = {underlined}, expected {expected}",
+                );
             }
         }
     }

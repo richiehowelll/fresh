@@ -366,9 +366,7 @@ impl Editor {
                 if let Some(text) = self.clipboard.paste() {
                     if !text.is_empty() {
                         if let Some(settings) = &mut self.settings_state {
-                            if let Some(dialog) = settings.entry_dialog_mut() {
-                                dialog.insert_str(&text);
-                            }
+                            settings.paste_into_focused_text(&text);
                         }
                     }
                 }

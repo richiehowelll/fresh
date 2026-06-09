@@ -263,7 +263,7 @@ fn open_dialog_discovers_existing_worktree() {
 }
 
 /// Selecting the discovered worktree row shows the on-disk preview
-/// panel — the "On-disk worktree" header and the "Press Enter to
+/// panel — the "On-disk worktree" header and the "click / Enter to
 /// open" affordance — rather than a live window embed.
 #[test]
 fn discovered_worktree_preview_offers_open() {
@@ -285,7 +285,7 @@ fn discovered_worktree_preview_offers_open() {
     harness
         .wait_until(|h| {
             let s = h.screen_to_string();
-            s.contains("On-disk worktree") && s.contains("Press Enter to open")
+            s.contains("On-disk worktree") && s.contains("to open this worktree as a session")
         })
         .unwrap_or_else(|_| {
             panic!(
@@ -390,13 +390,16 @@ fn new_session_form_hints_existing_worktree() {
         });
 }
 
-/// Discovered on-disk worktree rows sort *after* the live sessions:
-/// the base session's list row appears above the discovered worktree
-/// row. The base list row is identified by the `[ ]` checkbox + the
-/// `BASE` badge (both unique to that list row); the discovered row by
-/// its `· on-disk` tag.
+/// The session list sorts by a *stable* key: the project's own checkout
+/// (the `mainrepo` base) sits above its linked worktrees, then rows are
+/// alphabetical. This grouping is by `root == projectPath`, NOT by
+/// live/discovered state — so a worktree keeps its place when opened (see
+/// `dock_opening_worktree_keeps_its_row_position`) instead of jumping into
+/// a "live" group. Here the `mainrepo` base row stays above the discovered
+/// `feature-x` worktree. The base row is identified by its `[ ]` checkbox
+/// and the absence of the `· on-disk` tag (which marks the worktree).
 #[test]
-fn discovered_rows_sort_after_live_sessions() {
+fn rows_sort_stably_main_checkout_above_worktrees() {
     let (_temp, repo, _wt) = set_up_repo_with_worktree();
     let mut harness = EditorTestHarness::with_working_dir(160, 50, repo.clone()).unwrap();
     harness.tick_and_render().unwrap();
@@ -410,18 +413,15 @@ fn discovered_rows_sort_after_live_sessions() {
 
     let screen = harness.screen_to_string();
     let lines: Vec<&str> = screen.lines().collect();
-    // The live launch session is the `mainrepo` row with a checkbox and
-    // no `· on-disk` tag (that tag marks the discovered worktree). There
-    // is no longer a `BASE` badge — id 1 is just a normal session now.
-    let live_idx = lines
+    let base_idx = lines
         .iter()
         .position(|l| l.contains("[ ]") && l.contains("mainrepo") && !l.contains("· on-disk"));
     let disc_idx = lines.iter().position(|l| l.contains("· on-disk"));
     assert!(
-        live_idx.is_some() && disc_idx.is_some() && live_idx < disc_idx,
-        "live launch session must list above the discovered worktree.\n\
-         live_idx={:?} disc_idx={:?}\nScreen:\n{}",
-        live_idx,
+        base_idx.is_some() && disc_idx.is_some() && base_idx < disc_idx,
+        "main checkout (mainrepo) must sort above its worktrees, independent \
+         of live/discovered state.\nbase_idx={:?} disc_idx={:?}\nScreen:\n{}",
+        base_idx,
         disc_idx,
         screen
     );
@@ -766,14 +766,17 @@ fn dock_row_of(harness: &EditorTestHarness, needle: &str) -> usize {
         .unwrap_or_else(|| panic!("screen missing '{needle}':\n{screen}"))
 }
 
-/// Pressing Enter on a discovered (on-disk) worktree row in the *dock*
-/// attaches a managed session at that worktree — the same outcome the
-/// Open dialog produces. Before the fix the dock's Enter always blurred
-/// to the editor, so the on-disk attach was silently dropped: diving a
-/// worktree worked from the dialog but did nothing from the dock.
+/// Clicking a discovered (on-disk) worktree row in the *dock* opens it
+/// directly — it attaches a managed session at that worktree, the same
+/// outcome the Open dialog produces. There's no live window to switch
+/// to, so a click can't "live-switch" the way it does for a live row;
+/// before the fix the click was therefore a silent no-op and visiting an
+/// inactive session from the dock did nothing (you had to press Enter or
+/// the Visit button). The dock's Enter (`dock_activate`) path still works
+/// too — this just makes a click open the worktree without that step.
 #[test]
 #[cfg_attr(target_os = "windows", ignore)] // attach spawns a Unix shell terminal.
-fn dock_enter_attaches_discovered_worktree() {
+fn dock_click_attaches_discovered_worktree() {
     if !pty_available() {
         eprintln!("skipping: no PTY available in this environment");
         return;
@@ -802,13 +805,9 @@ fn dock_enter_attaches_discovered_worktree() {
             )
         });
 
-    // Click the discovered row to select it, then Enter to activate.
+    // A single click on the discovered row opens it — no Enter needed.
     let row = dock_row_of(&harness, "· on-disk") as u16;
     harness.mouse_click(3, row).unwrap();
-    harness.render().unwrap();
-    harness
-        .send_key(KeyCode::Enter, KeyModifiers::NONE)
-        .unwrap();
 
     // Attach is async (`createWindowWithTerminal`). It opens a live
     // session rooted at the worktree, so the dock's discovered row turns
@@ -820,11 +819,132 @@ fn dock_enter_attaches_discovered_worktree() {
         })
         .unwrap_or_else(|_| {
             panic!(
-                "Enter on the dock's discovered worktree row should attach a live \
+                "Clicking the dock's discovered worktree row should attach a live \
                  session (row loses `· on-disk`).\nScreen:\n{}",
                 harness.screen_to_string()
             )
         });
+}
+
+/// Arrowing the dock's highlight onto a discovered (on-disk) worktree
+/// opens it — keyboard parity with the click path. The dock's live-switch
+/// treats the highlighted row as the active session, so for an inactive
+/// worktree "becoming active" means attaching a session there. No click
+/// and no Enter: just moving the selection onto it with the keyboard.
+#[test]
+#[cfg_attr(target_os = "windows", ignore)] // attach spawns a Unix shell terminal.
+fn dock_arrow_nav_opens_discovered_worktree() {
+    if !pty_available() {
+        eprintln!("skipping: no PTY available in this environment");
+        return;
+    }
+    let (_temp, repo, _wt) = set_up_repo_with_worktree();
+    let mut harness = EditorTestHarness::with_working_dir(160, 50, repo.clone()).unwrap();
+    harness.tick_and_render().unwrap();
+    wait_for_command(&mut harness, "Orchestrator: Toggle Dock");
+
+    open_dock(&mut harness);
+
+    // Alt+T reveals the discovered on-disk worktree below the base session.
+    harness
+        .send_key(KeyCode::Char('t'), KeyModifiers::ALT)
+        .unwrap();
+    harness
+        .wait_until(|h| {
+            let s = h.screen_to_string();
+            s.contains("feature-x") && s.contains("· on-disk")
+        })
+        .unwrap_or_else(|_| {
+            panic!(
+                "dock should reveal the on-disk `feature-x` worktree after Alt+T.\n\
+                 Screen:\n{}",
+                harness.screen_to_string()
+            )
+        });
+
+    // Move the highlight down onto the on-disk row — no click, no Enter.
+    // The debounced live-switch then opens it.
+    harness.send_key(KeyCode::Down, KeyModifiers::NONE).unwrap();
+
+    harness
+        .wait_until(|h| {
+            let s = h.screen_to_string();
+            s.contains("feature-x") && !s.contains("· on-disk")
+        })
+        .unwrap_or_else(|_| {
+            panic!(
+                "Arrowing onto the dock's discovered worktree row should open it \
+                 (row loses `· on-disk`).\nScreen:\n{}",
+                harness.screen_to_string()
+            )
+        });
+}
+
+/// Opening a discovered worktree from the dock keeps it in the *same row*
+/// — the sort is stable. The order is the `mainrepo` base (main checkout)
+/// first, then its worktrees alphabetically (`feature-x`, `feature-y`);
+/// opening `feature-x` turns it live but it must stay above `feature-y`
+/// rather than jumping into a "live" group (the old live-before-discovered
+/// sort shuffled rows under you as you navigated).
+#[test]
+#[cfg_attr(target_os = "windows", ignore)] // attach spawns a Unix shell terminal.
+fn dock_opening_worktree_keeps_its_row_position() {
+    if !pty_available() {
+        eprintln!("skipping: no PTY available in this environment");
+        return;
+    }
+    let (_temp, repo, _wt1, _wt2) = set_up_repo_with_two_worktrees();
+    let mut harness = EditorTestHarness::with_working_dir(160, 50, repo.clone()).unwrap();
+    harness.tick_and_render().unwrap();
+    wait_for_command(&mut harness, "Orchestrator: Toggle Dock");
+
+    open_dock(&mut harness);
+    harness
+        .send_key(KeyCode::Char('t'), KeyModifiers::ALT)
+        .unwrap();
+    harness
+        .wait_until(|h| {
+            let s = h.screen_to_string();
+            s.contains("feature-x") && s.contains("feature-y") && s.contains("· on-disk")
+        })
+        .unwrap();
+
+    // Stable lexicographic order before opening: feature-x above feature-y.
+    let fx_before = dock_row_of(&harness, "feature-x");
+    let fy_before = dock_row_of(&harness, "feature-y");
+    assert!(
+        fx_before < fy_before,
+        "initial order should be lexicographic (feature-x above feature-y).\n\
+         Screen:\n{}",
+        harness.screen_to_string()
+    );
+
+    // Open feature-x by clicking it.
+    harness.mouse_click(3, fx_before as u16).unwrap();
+    harness
+        .wait_until(|h| {
+            // feature-x is now live (its on-disk tag is gone) while feature-y
+            // is still discovered.
+            let s = h.screen_to_string();
+            s.matches("· on-disk").count() == 1 && s.contains("feature-y")
+        })
+        .unwrap_or_else(|_| {
+            panic!(
+                "clicking feature-x should open it (one on-disk row left).\n\
+                 Screen:\n{}",
+                harness.screen_to_string()
+            )
+        });
+
+    // Stable: feature-x kept its place above feature-y after going live.
+    let fx_after = dock_row_of(&harness, "feature-x");
+    let fy_after = dock_row_of(&harness, "feature-y");
+    assert!(
+        fx_after < fy_after,
+        "opening feature-x must not reorder it below feature-y — the sort is \
+         stable.\nfx_after={fx_after} fy_after={fy_after}\nScreen:\n{}",
+        harness.screen_to_string()
+    );
 }
 
 /// Archiving the *last* session — which is also the launch / in-place

@@ -524,6 +524,7 @@ pub enum Action {
     CycleLiveGrepProvider,
     ToggleLineWrap,
     ToggleCurrentLineHighlight,
+    ToggleOccurrenceHighlight,
     ToggleReadOnly,
     TogglePageView,
     SetPageWidth,
@@ -710,6 +711,7 @@ pub enum Action {
     FindPrevious,
     FindSelectionNext,     // Quick find next occurrence of selection (Ctrl+F3)
     FindSelectionPrevious, // Quick find previous occurrence of selection (Ctrl+Shift+F3)
+    ClearSearch,           // Clear active search highlights (no-op if no search is active)
     Replace,
     QueryReplace, // Interactive replace (y/n/!/q for each match)
 
@@ -1017,6 +1019,7 @@ impl Action {
             "cycle_live_grep_provider" => CycleLiveGrepProvider,
             "toggle_line_wrap" => ToggleLineWrap,
             "toggle_current_line_highlight" => ToggleCurrentLineHighlight,
+            "toggle_occurrence_highlight" => ToggleOccurrenceHighlight,
             "toggle_read_only" => ToggleReadOnly,
             "toggle_page_view" => TogglePageView,
             "set_page_width" => SetPageWidth,
@@ -1168,6 +1171,7 @@ impl Action {
             "find_previous" => FindPrevious,
             "find_selection_next" => FindSelectionNext,
             "find_selection_previous" => FindSelectionPrevious,
+            "clear_search" => ClearSearch,
             "replace" => Replace,
             "query_replace" => QueryReplace,
 
@@ -2426,6 +2430,7 @@ impl KeybindingResolver {
             Action::InspectThemeAtCursor => t!("action.inspect_theme_at_cursor"),
             Action::ToggleLineWrap => t!("action.toggle_line_wrap"),
             Action::ToggleCurrentLineHighlight => t!("action.toggle_current_line_highlight"),
+            Action::ToggleOccurrenceHighlight => t!("action.toggle_occurrence_highlight"),
             Action::ToggleReadOnly => t!("action.toggle_read_only"),
             Action::TogglePageView => t!("action.toggle_page_view"),
             Action::SetPageWidth => t!("action.set_page_width"),
@@ -2563,6 +2568,7 @@ impl KeybindingResolver {
             Action::FindPrevious => t!("action.find_previous"),
             Action::FindSelectionNext => t!("action.find_selection_next"),
             Action::FindSelectionPrevious => t!("action.find_selection_previous"),
+            Action::ClearSearch => t!("action.clear_search"),
             Action::Replace => t!("action.replace"),
             Action::QueryReplace => t!("action.query_replace"),
             Action::MenuActivate => t!("action.menu_activate"),

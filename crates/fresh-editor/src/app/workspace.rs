@@ -593,6 +593,15 @@ impl crate::app::window::Window {
         for terminal in terminals {
             if let Some(buffer_id) = self.restore_terminal_from_workspace(terminal) {
                 terminal_buffer_map.insert(terminal.terminal_index, buffer_id);
+                // The terminal was live when the session was saved and the
+                // user never explicitly exited it, so focusing it should
+                // bring back a live terminal rather than the read-only
+                // scrollback view. Seed the resume set so `set_active_buffer`
+                // re-enters terminal mode when the tab is focused (the
+                // editing-disabled completion in `Editor::set_active_buffer`
+                // finishes the read-only → live transition). An explicit
+                // Ctrl+Space exit later removes it from the set as usual.
+                self.terminal_mode_resume.insert(buffer_id);
             }
         }
         terminal_buffer_map
@@ -724,8 +733,32 @@ impl crate::app::window::Window {
         self.terminal_backing_files
             .insert(predicted_id, backing_path.clone());
 
-        // Spawn the terminal with backing file for incremental scrollback
-        let wrapper_for_spawn = self.resolved_terminal_wrapper();
+        // Decide what to run in the restored terminal:
+        //  1. an agent-resume argv (rejoin the conversation), when present
+        //     and resume is enabled — `claude --resume <id>` / `--continue`;
+        //  2. else the launch command (re-run the agent / shell);
+        //  3. else the configured shell.
+        // The resume argv runs as the PTY child through the authority's
+        // wrapper, exactly like a launch command (mirrors
+        // `spawn_terminal_session`).
+        let resume_argv = terminal
+            .agent_resume
+            .as_ref()
+            .map(|r| &r.argv)
+            .filter(|argv| !argv.is_empty() && self.resources.config.terminal.resume_agents);
+        let spawn_argv =
+            resume_argv.or_else(|| terminal.command.as_ref().filter(|argv| !argv.is_empty()));
+        let wrapper_for_spawn = match spawn_argv {
+            Some(argv) => {
+                let (command, args) = argv.split_first().expect("non-empty argv");
+                crate::services::authority::TerminalWrapper {
+                    command: command.clone(),
+                    args: args.to_vec(),
+                    manages_cwd: false,
+                }
+            }
+            None => self.resolved_terminal_wrapper(),
+        };
         let terminal_id = match self.terminal_manager.spawn(
             terminal.cols,
             terminal.rows,
@@ -753,6 +786,19 @@ impl crate::app::window::Window {
                 .insert(terminal_id, backing_path.clone());
             self.terminal_log_files.remove(&predicted_id);
             self.terminal_backing_files.remove(&predicted_id);
+        }
+
+        // Carry the restore markers forward (even the empty-vec plain-shell
+        // marker) so a later save re-persists them and the session keeps
+        // restoring — and resuming — across multiple restarts.
+        if let Some(argv) = terminal.command.as_ref() {
+            self.terminal_commands.insert(terminal_id, argv.clone());
+        }
+        if let Some(resume) = terminal.agent_resume.as_ref() {
+            if !resume.argv.is_empty() {
+                self.terminal_resume_commands
+                    .insert(terminal_id, resume.argv.clone());
+            }
         }
 
         // Create buffer for this terminal
@@ -1266,6 +1312,26 @@ impl crate::app::window::Window {
                         buf_state.viewport.top_byte,
                         buf_state.view_mode,
                     );
+                }
+
+                // Pane-buffer invariant repair (issue #1939): the leaf must end
+                // up pointing at a buffer that is one of its restored tabs. If
+                // the saved active tab couldn't be resolved — e.g. it referenced
+                // an empty `[No Name]` buffer that was never persisted to
+                // recovery, or a terminal that failed to respawn —
+                // `active_buffer_id` is still `None` here. Leaving it `None`
+                // means the leaf keeps pointing at the throwaway seed buffer set
+                // by `restore_split_node` (`set_pane_buffer(.., active_buffer())`),
+                // which is absent from `open_buffers`. `clean_orphaned_buffers`
+                // then removes that seed, leaving the split-manager leaf dangling
+                // at a dead `BufferId` — the render path paints it blank while
+                // `effective_active_pair` falls back elsewhere for the status
+                // bar. Fall back to the first surviving tab so the tree, the
+                // view state, and the tab list all agree. (When `open_buffers`
+                // is empty the #1278 re-add above already seeded it with the
+                // leaf's own buffer, so this keeps that buffer instead.)
+                if active_buffer_id.is_none() {
+                    active_buffer_id = view_state.buffer_tab_ids().next();
                 }
 
                 // For buffers without saved file_state (e.g., terminals), apply split-level
@@ -1987,7 +2053,15 @@ impl crate::app::window::Window {
         let mut seen = HashSet::new();
         for terminal_id in self.terminal_buffers.values().copied() {
             if seen.insert(terminal_id) {
-                if self.ephemeral_terminals.contains(&terminal_id) {
+                let command = self.terminal_commands.get(&terminal_id).cloned();
+                // Ephemeral terminals (plugin tool UIs, agent shells) are
+                // normally dropped on save. An ephemeral terminal that
+                // carries a spawn command is the exception: it's an agent
+                // session whose defining process we *can* reproduce, so we
+                // persist a record (with the command) and re-run it on
+                // restore. Commandless ephemerals (build output, exec
+                // shells) stay transient.
+                if self.ephemeral_terminals.contains(&terminal_id) && command.is_none() {
                     continue;
                 }
                 let idx = terminals.len();
@@ -2017,6 +2091,11 @@ impl crate::app::window::Window {
                         root.join(format!("fresh-terminal-{}.txt", terminal_id.0))
                     });
 
+                let agent_resume = self
+                    .terminal_resume_commands
+                    .get(&terminal_id)
+                    .filter(|argv| !argv.is_empty())
+                    .map(|argv| crate::workspace::AgentResume { argv: argv.clone() });
                 terminals.push(SerializedTerminalWorkspace {
                     terminal_index: idx,
                     cwd,
@@ -2025,6 +2104,8 @@ impl crate::app::window::Window {
                     rows,
                     log_path,
                     backing_path,
+                    command,
+                    agent_resume,
                 });
             }
         }

@@ -66,6 +66,18 @@ use std::sync::Arc;
 /// (`active_layout()`, `split_manager()`, `file_explorer()`, `lsp()`,
 /// `panel_ids()`, `file_mod_times()`, …). Cross-window access goes
 /// through `Editor.windows.get(&id)` directly.
+/// A clickable path-link highlighted under a Ctrl+hover in the live terminal
+/// grid. Coordinates are relative to the terminal content area.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TerminalLinkHover {
+    /// The terminal buffer the link is in.
+    pub buffer_id: BufferId,
+    /// Grid row (0-based, within the content area) containing the link.
+    pub row: u16,
+    /// Column range (0-based char columns) the link spans, for underlining.
+    pub cols: std::ops::Range<usize>,
+}
+
 pub struct Window {
     /// Stable identifier. The base window is always `WindowId(1)`.
     pub id: WindowId,
@@ -374,6 +386,12 @@ pub struct Window {
     /// buffers are per-window (Step 0d).
     pub terminal_mode_resume: std::collections::HashSet<BufferId>,
 
+    /// Path-link currently highlighted under a Ctrl+hover over the live
+    /// terminal grid. `Some` means the renderer underlines the given grid row
+    /// columns to signal it's clickable. Cleared when Ctrl is released or the
+    /// pointer leaves a resolvable path. See [`TerminalLinkHover`].
+    pub terminal_link_hover: Option<TerminalLinkHover>,
+
     /// Track which byte ranges have been seen per buffer (for the
     /// `lines_changed` plugin-hook optimisation). Keyed by `BufferId`,
     /// follows the buffers onto Window.
@@ -613,6 +631,22 @@ pub struct Window {
     /// user-opened terminals are absent and persist as before.
     pub ephemeral_terminals: std::collections::HashSet<crate::services::terminal::TerminalId>,
 
+    /// Argv each terminal was spawned with, when it ran a command other
+    /// than the plain shell (e.g. an Orchestrator agent). Captured at spawn
+    /// and persisted into the workspace so a restored session re-runs the
+    /// same command rather than coming back as a bare shell. Terminals
+    /// spawned as a plain shell have no entry.
+    pub terminal_commands:
+        std::collections::HashMap<crate::services::terminal::TerminalId, Vec<String>>,
+
+    /// Argv to run on *restore* instead of re-running the launch command,
+    /// for terminals that carry an agent-resume spec (Orchestrator sets this
+    /// to e.g. `claude --resume <id>` / `claude --continue`). Persisted into
+    /// the workspace's `agent_resume`; absent for plain terminals, which
+    /// just re-run their launch command.
+    pub terminal_resume_commands:
+        std::collections::HashMap<crate::services::terminal::TerminalId, Vec<String>>,
+
     /// Plugin-development workspace per buffer (temp dir + LSP
     /// configuration for plugin buffers). Buffer-keyed and buffers
     /// are per-window, so the workspace map follows.
@@ -672,6 +706,10 @@ pub struct Window {
 
     /// Tab context menu state (right-click on a tab in this window).
     pub tab_context_menu: Option<crate::app::types::TabContextMenu>,
+
+    /// "+" new-tab popup menu state (left-click on the tab bar's trailing
+    /// `+` button). Offers "New Terminal" / "New File".
+    pub new_tab_menu: Option<crate::app::types::NewTabMenu>,
 
     /// File-explorer context menu state (right-click in the explorer).
     pub file_explorer_context_menu: Option<crate::app::types::FileExplorerContextMenu>,
@@ -1712,6 +1750,7 @@ impl Window {
             dock_cols: 0,
             preview: None,
             terminal_mode: false,
+            terminal_link_hover: None,
             terminal_mode_resume: std::collections::HashSet::new(),
             seen_byte_ranges: HashMap::new(),
             previous_viewports: HashMap::new(),
@@ -1771,6 +1810,8 @@ impl Window {
             pending_file_poll_rx: None,
             pending_dir_poll_rx: None,
             ephemeral_terminals: std::collections::HashSet::new(),
+            terminal_commands: std::collections::HashMap::new(),
+            terminal_resume_commands: std::collections::HashMap::new(),
             plugin_dev_workspaces: HashMap::new(),
             status_bar_values: HashMap::new(),
             mouse_state: crate::app::types::MouseState::default(),
@@ -1791,6 +1832,7 @@ impl Window {
             last_persistent_auto_save: now,
             warning_domains: crate::app::warning_domains::WarningDomainRegistry::default(),
             tab_context_menu: None,
+            new_tab_menu: None,
             file_explorer_context_menu: None,
             theme_info_popup: None,
             event_debug: None,
@@ -1979,6 +2021,16 @@ impl Window {
         self.buffers
             .get_mut(&buf)
             .expect("active buffer must be present in window")
+    }
+
+    /// Mutable handle to a specific buffer's editor state, if it is loaded in this window.
+    pub fn buffer_state_mut(&mut self, id: BufferId) -> Option<&mut crate::state::EditorState> {
+        self.buffers.get_mut(&id)
+    }
+
+    /// Read-only handle to a specific buffer's editor state, if it is loaded in this window.
+    pub fn buffer_state(&self, id: BufferId) -> Option<&crate::state::EditorState> {
+        self.buffers.get(&id)
     }
 
     /// Read-only cursor set for the active buffer in the active split.

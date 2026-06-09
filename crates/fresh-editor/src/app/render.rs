@@ -55,34 +55,8 @@ impl Editor {
         let _span = tracing::info_span!("render").entered();
         let size = frame.area();
 
-        // Drain any plugin commands enqueued BEFORE this frame began —
-        // notably `UnmountFloatingWidget` from a Toggle-Dock invocation
-        // earlier in the same input cycle. The mid-render
-        // `process_commands` block below runs *after* `compute_dock_split`,
-        // so without this early drain the dock unmount lands too late:
-        // this frame computes `dock_area` / `chrome_area` from the stale
-        // `self.dock = Some(_)`, the chrome paints into the post-dock
-        // offset column, and the freed columns render as blank
-        // whitespace until the next user input forces another render.
-        #[cfg(feature = "plugins")]
-        {
-            let early_commands = self.plugin_manager.write().unwrap().process_commands();
-            if !early_commands.is_empty() {
-                tracing::trace!(
-                    count = early_commands.len(),
-                    "process_commands at top of render (pre-layout drain)"
-                );
-                for command in early_commands {
-                    if let Err(e) = self.handle_plugin_command(command) {
-                        tracing::error!("Error handling plugin command (pre-layout drain): {}", e);
-                    }
-                }
-            }
-        }
+        self.drain_pre_layout_plugin_commands();
 
-        // Refresh terminal tab titles from any OSC 0/1/2 title the running
-        // programs set since the last frame. Done for every window so
-        // background tabs stay current, not just the active one.
         for window in self.windows.values_mut() {
             window.sync_terminal_titles();
         }
@@ -108,118 +82,14 @@ impl Editor {
         // Reset per-cell theme key map for this frame
         self.active_chrome_mut().reset_cell_theme_map();
 
-        // For scroll sync groups, we need to update the active split's viewport position BEFORE
-        // calling sync_scroll_groups, so that the sync reads the correct position.
-        // Otherwise, cursor movements like 'G' (go to end) won't sync properly because
-        // viewport.top_byte hasn't been updated yet.
-        let active_split = self
-            .windows
-            .get(&self.active_window)
-            .and_then(|w| w.buffers.splits())
-            .map(|(mgr, _)| mgr)
-            .expect("active window must have a populated split layout")
-            .active_split();
-        {
-            let _span = tracing::info_span!("pre_sync_ensure_visible").entered();
-            self.active_window_mut()
-                .pre_sync_ensure_visible(active_split);
-        }
-
-        // Synchronize scroll sync groups (anchor-based scroll for side-by-side diffs)
-        // This sets viewport positions based on the authoritative scroll_line in each group
-        {
-            let _span = tracing::info_span!("sync_scroll_groups").entered();
-            self.active_window_mut().sync_scroll_groups();
-        }
+        self.pre_sync_and_scroll_sync();
 
         // NOTE: Viewport sync with cursor is handled by split_rendering.rs which knows the
         // correct content area dimensions. Don't sync here with incorrect EditorState viewport size.
 
-        // Prepare all buffers for rendering (pre-load viewport data for lazy loading)
-        // Each split may have a different viewport position on the same buffer
-        let mut semantic_ranges: std::collections::HashMap<BufferId, (usize, usize)> =
-            std::collections::HashMap::new();
-        {
-            let _span = tracing::info_span!("compute_semantic_ranges").entered();
-            for (split_id, view_state) in self
-                .windows
-                .get(&self.active_window)
-                .and_then(|w| w.buffers.splits())
-                .map(|(_, vs)| vs)
-                .expect("active window must have a populated split layout")
-            {
-                if let Some(buffer_id) = self
-                    .windows
-                    .get(&self.active_window)
-                    .and_then(|w| w.buffers.splits())
-                    .map(|(mgr, _)| mgr)
-                    .expect("active window must have a populated split layout")
-                    .get_buffer_id((*split_id).into())
-                {
-                    if let Some(state) = self
-                        .windows
-                        .get(&self.active_window)
-                        .map(|w| &w.buffers)
-                        .expect("active window present")
-                        .get(&buffer_id)
-                    {
-                        let start_line = state.buffer.get_line_number(view_state.viewport.top_byte);
-                        let visible_lines =
-                            view_state.viewport.visible_line_count().saturating_sub(1);
-                        let end_line = start_line.saturating_add(visible_lines);
-                        semantic_ranges
-                            .entry(buffer_id)
-                            .and_modify(|(min_start, max_end)| {
-                                *min_start = (*min_start).min(start_line);
-                                *max_end = (*max_end).max(end_line);
-                            })
-                            .or_insert((start_line, end_line));
-                    }
-                }
-            }
-        }
-        for (buffer_id, (start_line, end_line)) in semantic_ranges {
-            self.maybe_request_semantic_tokens_range(buffer_id, start_line, end_line);
-            self.maybe_request_semantic_tokens_full_debounced(buffer_id);
-            self.maybe_request_folding_ranges_debounced(buffer_id);
-        }
+        self.request_semantic_ranges_for_visible_splits();
 
-        {
-            let _span = tracing::info_span!("prepare_for_render").entered();
-            // Pre-collect (split_id, top_byte, height, buffer_id) so we
-            // can mutate buffers below without holding a read borrow on
-            // self.windows.
-            let active_id = self.active_window;
-            let prep_targets: Vec<(BufferId, usize, u16)> = {
-                let win = self
-                    .windows
-                    .get(&active_id)
-                    .expect("active window must exist");
-                let (mgr, vs_map) = win
-                    .buffers
-                    .splits()
-                    .expect("active window must have a populated split layout");
-                vs_map
-                    .iter()
-                    .filter_map(|(split_id, vs)| {
-                        mgr.get_buffer_id((*split_id).into())
-                            .map(|bid| (bid, vs.viewport.top_byte, vs.viewport.height))
-                    })
-                    .collect()
-            };
-            let win_buffers = &mut self
-                .windows
-                .get_mut(&active_id)
-                .expect("active window must exist")
-                .buffers;
-            for (buffer_id, top_byte, height) in prep_targets {
-                if let Some(state) = win_buffers.get_mut(&buffer_id) {
-                    if let Err(e) = state.prepare_for_render(top_byte, height) {
-                        tracing::error!("Failed to prepare buffer for render: {}", e);
-                    }
-                }
-            }
-        }
+        self.prepare_visible_buffers_for_render();
 
         // Refresh search highlights only during incremental search (when prompt is active)
         // After search is confirmed, overlays exist for ALL matches and shouldn't be overwritten
@@ -859,6 +729,13 @@ impl Editor {
         // panes or moved more than two rows within the same pane. The
         // trail crosses pane separators when the jump is across splits —
         // that's the intended "follow the focus" cue.
+        let active_split = self
+            .windows
+            .get(&self.active_window)
+            .and_then(|w| w.buffers.splits())
+            .map(|(mgr, _)| mgr)
+            .expect("active window must have a populated split layout")
+            .active_split();
         self.maybe_start_cursor_jump_animation(pending_hardware_cursor, active_split);
 
         // Detect viewport changes and fire hooks
@@ -1207,6 +1084,8 @@ impl Editor {
                 status_bar_layout.language_indicator;
             self.active_chrome_mut().status_bar_message_area = status_bar_layout.message_area;
             self.active_chrome_mut().status_bar_remote_area = status_bar_layout.remote_indicator;
+            self.active_chrome_mut().status_bar_plugin_token_areas =
+                status_bar_layout.plugin_token_areas;
         }
 
         // Render search options bar when in search prompt
@@ -1671,6 +1550,12 @@ impl Editor {
             self.render_file_explorer_context_menu(frame, &menu);
         }
 
+        // Render the "+" new-tab popup menu if open
+        let new_tab_menu = self.active_window().new_tab_menu.clone();
+        if let Some(menu) = new_tab_menu {
+            self.render_new_tab_menu(frame, &menu);
+        }
+
         // Record non-editor region theme keys for the theme inspector
         self.record_non_editor_theme_regions();
 
@@ -1776,6 +1661,14 @@ impl Editor {
                 .as_ref()
                 .map(|f| f.fullscreen)
                 .unwrap_or(false);
+            // An anchored context-menu popup is unobtrusive: it neither
+            // dims the dock nor confines itself to `chrome_area` (its
+            // anchor is an absolute screen cell that may sit over the
+            // dock). Treat it like a non-dimming, full-frame placement.
+            let is_anchored = matches!(
+                self.floating_widget_panel.as_ref().map(|f| f.placement),
+                Some(super::PanelPlacement::Anchored { .. })
+            );
             // A centered modal makes the *whole* UI a passive, dimmed
             // background — the dock included. The dock was drawn above at
             // full brightness. A beside-dock modal only dims `chrome_area`,
@@ -1786,7 +1679,7 @@ impl Editor {
             // modal is up (the host blurs it on mount and the modal swallows
             // keys/clicks/wheel), so dimming it makes that passivity visible
             // rather than leaving it looking live beside the dialog.
-            if !fullscreen {
+            if !fullscreen && !is_anchored {
                 if let Some(dock) = dock_area {
                     if self.dock.is_some() {
                         crate::view::dimming::apply_dimming(frame, dock);
@@ -1802,8 +1695,154 @@ impl Editor {
             // with the dock — mirroring the settings / keybinding-editor
             // modals, which already lay into `chrome_area`. A `fullscreen`
             // panel instead gets the whole frame (`size`).
-            let modal_area = if fullscreen { size } else { chrome_area };
+            let modal_area = if fullscreen || is_anchored {
+                size
+            } else {
+                chrome_area
+            };
             self.render_floating_widget_panel(frame, modal_area, super::PanelSlot::Floating);
+        }
+    }
+
+    /// Drain plugin commands enqueued before this frame's layout pass.
+    ///
+    /// Must run before `compute_dock_split` because commands such as
+    /// `UnmountFloatingWidget` affect the dock state that layout reads.
+    /// The mid-render drain (after `compute_dock_split`) runs too late for
+    /// those: the dock area would be computed from stale state and the freed
+    /// columns would render blank until the next input event.
+    fn drain_pre_layout_plugin_commands(&mut self) {
+        #[cfg(feature = "plugins")]
+        {
+            let early_commands = self.plugin_manager.write().unwrap().process_commands();
+            if !early_commands.is_empty() {
+                tracing::trace!(
+                    count = early_commands.len(),
+                    "process_commands at top of render (pre-layout drain)"
+                );
+                for command in early_commands {
+                    if let Err(e) = self.handle_plugin_command(command) {
+                        tracing::error!("Error handling plugin command (pre-layout drain): {}", e);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Ensure the active split's cursor is in view, then synchronise scroll-sync groups.
+    ///
+    /// Order matters: `sync_scroll_groups` reads the `viewport.top_byte` that
+    /// `pre_sync_ensure_visible` just updated.  Doing it after the render would
+    /// produce a one-frame lag on cursor moves that trigger a scroll-sync anchor
+    /// change (e.g. `G` in a side-by-side diff).
+    fn pre_sync_and_scroll_sync(&mut self) {
+        let active_split = self
+            .windows
+            .get(&self.active_window)
+            .and_then(|w| w.buffers.splits())
+            .map(|(mgr, _)| mgr)
+            .expect("active window must have a populated split layout")
+            .active_split();
+        {
+            let _span = tracing::info_span!("pre_sync_ensure_visible").entered();
+            self.active_window_mut()
+                .pre_sync_ensure_visible(active_split);
+        }
+        {
+            let _span = tracing::info_span!("sync_scroll_groups").entered();
+            self.active_window_mut().sync_scroll_groups();
+        }
+    }
+
+    /// Compute the visible byte range for each split and issue debounced LSP
+    /// requests for semantic tokens and folding ranges.
+    fn request_semantic_ranges_for_visible_splits(&mut self) {
+        let mut semantic_ranges: std::collections::HashMap<BufferId, (usize, usize)> =
+            std::collections::HashMap::new();
+        {
+            let _span = tracing::info_span!("compute_semantic_ranges").entered();
+            for (split_id, view_state) in self
+                .windows
+                .get(&self.active_window)
+                .and_then(|w| w.buffers.splits())
+                .map(|(_, vs)| vs)
+                .expect("active window must have a populated split layout")
+            {
+                if let Some(buffer_id) = self
+                    .windows
+                    .get(&self.active_window)
+                    .and_then(|w| w.buffers.splits())
+                    .map(|(mgr, _)| mgr)
+                    .expect("active window must have a populated split layout")
+                    .get_buffer_id((*split_id).into())
+                {
+                    if let Some(state) = self
+                        .windows
+                        .get(&self.active_window)
+                        .map(|w| &w.buffers)
+                        .expect("active window present")
+                        .get(&buffer_id)
+                    {
+                        let start_line = state.buffer.get_line_number(view_state.viewport.top_byte);
+                        let visible_lines =
+                            view_state.viewport.visible_line_count().saturating_sub(1);
+                        let end_line = start_line.saturating_add(visible_lines);
+                        semantic_ranges
+                            .entry(buffer_id)
+                            .and_modify(|(min_start, max_end)| {
+                                *min_start = (*min_start).min(start_line);
+                                *max_end = (*max_end).max(end_line);
+                            })
+                            .or_insert((start_line, end_line));
+                    }
+                }
+            }
+        }
+        for (buffer_id, (start_line, end_line)) in semantic_ranges {
+            self.maybe_request_semantic_tokens_range(buffer_id, start_line, end_line);
+            self.maybe_request_semantic_tokens_full_debounced(buffer_id);
+            self.maybe_request_folding_ranges_debounced(buffer_id);
+        }
+    }
+
+    /// Pre-load viewport data for each visible buffer.
+    ///
+    /// Large files use lazy loading: data outside the viewport isn't in memory.
+    /// This pass materialises the bytes each split needs before the renderer
+    /// touches them, so the render sees a fully-populated buffer.
+    fn prepare_visible_buffers_for_render(&mut self) {
+        let _span = tracing::info_span!("prepare_for_render").entered();
+        // Pre-collect targets so we can take a mut borrow on buffers below
+        // without holding the immutable read borrow on self.windows.
+        let active_id = self.active_window;
+        let prep_targets: Vec<(BufferId, usize, u16)> = {
+            let win = self
+                .windows
+                .get(&active_id)
+                .expect("active window must exist");
+            let (mgr, vs_map) = win
+                .buffers
+                .splits()
+                .expect("active window must have a populated split layout");
+            vs_map
+                .iter()
+                .filter_map(|(split_id, vs)| {
+                    mgr.get_buffer_id((*split_id).into())
+                        .map(|bid| (bid, vs.viewport.top_byte, vs.viewport.height))
+                })
+                .collect()
+        };
+        let win_buffers = &mut self
+            .windows
+            .get_mut(&active_id)
+            .expect("active window must exist")
+            .buffers;
+        for (buffer_id, top_byte, height) in prep_targets {
+            if let Some(state) = win_buffers.get_mut(&buffer_id) {
+                if let Err(e) = state.prepare_for_render(top_byte, height) {
+                    tracing::error!("Failed to prepare buffer for render: {}", e);
+                }
+            }
         }
     }
 
@@ -3494,6 +3533,64 @@ impl Editor {
         frame.render_widget(paragraph, area);
     }
 
+    /// Render the "+" new-tab popup menu (New Terminal / New File).
+    fn render_new_tab_menu(&self, frame: &mut Frame, menu: &super::types::NewTabMenu) {
+        use ratatui::style::Style;
+        use ratatui::text::{Line, Span};
+        use ratatui::widgets::{Block, Borders, Clear, Paragraph};
+
+        let items = super::types::NewTabMenuItem::all();
+        let menu_width = super::types::NEW_TAB_MENU_WIDTH;
+        let menu_height = items.len() as u16 + 2; // items + borders
+
+        let screen_width = frame.area().width;
+        let screen_height = frame.area().height;
+
+        let menu_x = if menu.position.0 + menu_width > screen_width {
+            screen_width.saturating_sub(menu_width)
+        } else {
+            menu.position.0
+        };
+        let menu_y = if menu.position.1 + menu_height > screen_height {
+            screen_height.saturating_sub(menu_height)
+        } else {
+            menu.position.1
+        };
+
+        let area = ratatui::layout::Rect::new(menu_x, menu_y, menu_width, menu_height);
+
+        frame.render_widget(Clear, area);
+
+        let mut lines = Vec::new();
+        for (idx, item) in items.iter().enumerate() {
+            let is_highlighted = idx == menu.highlighted;
+
+            let style = if is_highlighted {
+                Style::default()
+                    .fg(self.theme.read().unwrap().menu_highlight_fg)
+                    .bg(self.theme.read().unwrap().menu_highlight_bg)
+            } else {
+                Style::default()
+                    .fg(self.theme.read().unwrap().menu_dropdown_fg)
+                    .bg(self.theme.read().unwrap().menu_dropdown_bg)
+            };
+
+            let label = item.label();
+            let content_width = (menu_width as usize).saturating_sub(2);
+            let padded_label = format!(" {:<width$}", label, width = content_width - 1);
+
+            lines.push(Line::from(vec![Span::styled(padded_label, style)]));
+        }
+
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(self.theme.read().unwrap().menu_border_fg))
+            .style(Style::default().bg(self.theme.read().unwrap().menu_dropdown_bg));
+
+        let paragraph = Paragraph::new(lines).block(block);
+        frame.render_widget(paragraph, area);
+    }
+
     /// Render the file explorer context menu
     fn render_file_explorer_context_menu(
         &self,
@@ -3974,21 +4071,47 @@ impl Editor {
         // modal overlay. The centered placement keeps the historical
         // fit-to-content + background-dim behaviour.
         let is_dock = matches!(placement, super::PanelPlacement::LeftDock { .. });
-        let overlay_rect = if is_dock {
-            area
-        } else {
-            let requested = Self::centered_overlay_rect(area, width_pct, height_pct);
-            let needed_h = (entries.len() as u16).saturating_add(2);
-            let effective_h = needed_h.min(requested.height).max(3);
-            ratatui::layout::Rect {
-                x: requested.x,
-                y: area.y + (area.height.saturating_sub(effective_h)) / 2,
-                width: requested.width,
-                height: effective_h,
+        let overlay_rect = match placement {
+            super::PanelPlacement::LeftDock { .. } => area,
+            super::PanelPlacement::Anchored { x, y } => {
+                // Size to the rendered content (not a percentage): an
+                // unobtrusive popup hugs its items. Width = widest entry +
+                // borders; height = entry count + borders. Then clamp the
+                // top-left so the whole box stays on screen.
+                use crate::primitives::display_width::str_width;
+                let content_w = entries
+                    .iter()
+                    .map(|e| str_width(&e.text) as u16)
+                    .max()
+                    .unwrap_or(0);
+                let w = content_w.saturating_add(2).clamp(6, area.width);
+                let needed_h = (entries.len() as u16).saturating_add(2);
+                let h = needed_h.clamp(3, area.height);
+                let max_x = area.x + area.width.saturating_sub(w);
+                let max_y = area.y + area.height.saturating_sub(h);
+                ratatui::layout::Rect {
+                    x: x.clamp(area.x, max_x),
+                    y: y.clamp(area.y, max_y),
+                    width: w,
+                    height: h,
+                }
+            }
+            super::PanelPlacement::Centered => {
+                let requested = Self::centered_overlay_rect(area, width_pct, height_pct);
+                let needed_h = (entries.len() as u16).saturating_add(2);
+                let effective_h = needed_h.min(requested.height).max(3);
+                ratatui::layout::Rect {
+                    x: requested.x,
+                    y: area.y + (area.height.saturating_sub(effective_h)) / 2,
+                    width: requested.width,
+                    height: effective_h,
+                }
             }
         };
 
-        if !is_dock {
+        // Only the centered modal dims the background; the dock and the
+        // anchored context-menu popup paint over the editor without it.
+        if matches!(placement, super::PanelPlacement::Centered) {
             crate::view::dimming::apply_dimming_excluding(frame, area, Some(overlay_rect));
         }
         frame.render_widget(Clear, overlay_rect);

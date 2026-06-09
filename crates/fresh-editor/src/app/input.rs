@@ -427,6 +427,24 @@ impl Editor {
         // Create key event for dispatch methods
         let key_event = crossterm::event::KeyEvent::new(code, modifiers);
 
+        // Diagnostic for the "dock visible, buffer won't accept keys" wedge
+        // (#2234, item 4): while the dock is mounted, record its host-side focus
+        // plus the active window's key context for *every* key, before any
+        // routing. If a repro shows `dock_focused=true` for keys the user aimed
+        // at the buffer, the dock is swallowing them (line ~492) — a
+        // host-focus / plugin-`dockBlurred` desync; if `dock_focused=false`,
+        // the keys reached the window and the issue is in key-context routing.
+        if let Some(focused) = self.dock.as_ref().map(|d| d.focused) {
+            tracing::debug!(
+                target: "fresh::dock",
+                ?code,
+                dock_focused = focused,
+                key_context = ?self.active_window().key_context,
+                active_window = ?self.active_window_id(),
+                "handle_key: dock mounted (routing diagnostic)"
+            );
+        }
+
         // Event debug dialog intercepts ALL key events before any other processing.
         // This must be checked here (not just in main.rs/gui) so it works in
         // client/server mode where handle_key is called directly.
@@ -1193,9 +1211,11 @@ impl Editor {
                 self.handle_redo();
             }
             Action::ShowHelp => {
+                self.ensure_help_panel_mode_registered();
                 self.active_window_mut().open_help_manual();
             }
             Action::ShowKeyboardShortcuts => {
+                self.ensure_help_panel_mode_registered();
                 self.active_window_mut().open_keyboard_shortcuts();
             }
             Action::ShowWarnings => {
@@ -1396,6 +1416,31 @@ impl Editor {
                     t!("view.current_line_highlight_state", state = state).to_string(),
                 );
             }
+            Action::ToggleOccurrenceHighlight => {
+                let new_value = !self.config.editor.highlight_occurrences;
+                self.config_mut().editor.highlight_occurrences = new_value;
+
+                // Update all open buffers
+                for window in self.windows.values_mut() {
+                    for (_, state) in &mut window.buffers {
+                        state.reference_highlight_overlay.enabled = new_value;
+                        if !new_value {
+                            state
+                                .reference_highlight_overlay
+                                .clear(&mut state.overlays, &mut state.marker_list);
+                        }
+                    }
+                }
+
+                let state = if new_value {
+                    t!("view.state_enabled").to_string()
+                } else {
+                    t!("view.state_disabled").to_string()
+                };
+                self.set_status_message(
+                    t!("view.occurrence_highlight_state", state = state).to_string(),
+                );
+            }
             Action::ToggleReadOnly => {
                 let buffer_id = self.active_buffer();
                 let is_now_read_only = self
@@ -1578,6 +1623,9 @@ impl Editor {
             }
             Action::FindSelectionPrevious => {
                 self.find_selection_previous();
+            }
+            Action::ClearSearch => {
+                self.active_window_mut().clear_search_highlights();
             }
             Action::AddCursorNextMatch => self.add_cursor_at_next_match(),
             Action::AddCursorAbove => self.add_cursor_above(),
@@ -2461,7 +2509,7 @@ impl Editor {
         let panel_id = match self.panel(slot) {
             Some(fwp) => fwp.panel_id,
             None => {
-                tracing::warn!(
+                tracing::debug!(
                     target: "fresh::dock",
                     ?slot,
                     ?code,
@@ -2470,7 +2518,7 @@ impl Editor {
                 return false;
             }
         };
-        tracing::warn!(
+        tracing::debug!(
             target: "fresh::dock",
             panel_id,
             ?slot,
@@ -2496,6 +2544,55 @@ impl Editor {
                 .focus_key(panel_id)
                 .map(|k| k == "filter")
                 .unwrap_or(false);
+            // The project dropdown owns the keyboard while panel focus
+            // sits on one of its `project-pick:` rows (the plugin moves
+            // focus there when the menu opens). In that state ↑/↓ move
+            // the dropdown cursor, Enter commits it, and Esc cancels —
+            // all routed to the plugin as `dock_menu_*` events. Without
+            // this, those keys fell through to the generic list nav
+            // below and drove the session list *under* the open menu,
+            // so the dropdown was visible but un-navigable by keyboard.
+            let on_project_menu = self
+                .widget_registry
+                .focus_key(panel_id)
+                .map(|k| k.starts_with("project-pick:"))
+                .unwrap_or(false);
+            if on_project_menu {
+                match code {
+                    KeyCode::Up => {
+                        self.fire_dock_widget_event(panel_id, "dock_menu_prev");
+                        return true;
+                    }
+                    KeyCode::Down => {
+                        self.fire_dock_widget_event(panel_id, "dock_menu_next");
+                        return true;
+                    }
+                    // Tab/Shift+Tab navigate the menu too, so they can't
+                    // tab focus *out* of the open dropdown into the dock
+                    // toolbar behind it.
+                    KeyCode::Tab if modifiers.contains(KeyModifiers::SHIFT) => {
+                        self.fire_dock_widget_event(panel_id, "dock_menu_prev");
+                        return true;
+                    }
+                    KeyCode::BackTab => {
+                        self.fire_dock_widget_event(panel_id, "dock_menu_prev");
+                        return true;
+                    }
+                    KeyCode::Tab => {
+                        self.fire_dock_widget_event(panel_id, "dock_menu_next");
+                        return true;
+                    }
+                    KeyCode::Enter | KeyCode::Char(' ') => {
+                        self.fire_dock_widget_event(panel_id, "dock_menu_accept");
+                        return true;
+                    }
+                    KeyCode::Esc => {
+                        self.fire_dock_widget_event(panel_id, "dock_menu_cancel");
+                        return true;
+                    }
+                    _ => {}
+                }
+            }
             match code {
                 KeyCode::Esc => {
                     if on_filter {
@@ -2604,7 +2701,7 @@ impl Editor {
                         .read()
                         .unwrap()
                         .has_hook_handlers("widget_event");
-                    tracing::warn!(
+                    tracing::debug!(
                         target: "fresh::dock",
                         panel_id,
                         has_handler,

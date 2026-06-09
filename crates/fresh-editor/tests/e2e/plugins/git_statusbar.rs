@@ -17,6 +17,7 @@ fn test_status_bar_shows_custom_branch_token() {
             StatusBarElement::CustomToken("git_statusbar:branch".to_string()),
         ],
         right: vec![StatusBarElement::Encoding, StatusBarElement::Language],
+        ..StatusBarConfig::default()
     };
 
     let temp_dir = tempfile::TempDir::new().unwrap();

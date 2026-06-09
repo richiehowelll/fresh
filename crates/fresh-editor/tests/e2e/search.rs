@@ -3008,3 +3008,56 @@ fn test_search_status_bar_line_number_updates_on_f3() {
 
     harness.assert_screen_contains("Ln 5,");
 }
+
+#[test]
+fn test_clear_search_action() {
+    let temp_dir = tempfile::TempDir::new().unwrap();
+    let file_path = temp_dir.path().join("test.txt");
+
+    // Create a test file with searchable content
+    std::fs::write(&file_path, "hello world\nfoo bar\nhello again\nbaz").unwrap();
+
+    let mut harness = EditorTestHarness::new(100, 24).unwrap();
+    harness.open_file(&file_path).unwrap();
+    harness.render().unwrap();
+
+    // Trigger search with Ctrl+F
+    harness
+        .send_key(KeyCode::Char('f'), KeyModifiers::CONTROL)
+        .unwrap();
+    harness.render().unwrap();
+
+    // Type search query
+    harness.type_text("hello").unwrap();
+    harness.render().unwrap();
+
+    // Confirm search - Enter moves to first match
+    harness
+        .send_key(KeyCode::Enter, KeyModifiers::NONE)
+        .unwrap();
+    harness.process_async_and_render().unwrap();
+
+    // Wait for search overlays to appear
+    harness
+        .wait_until(|h| h.count_search_highlights() > 0)
+        .expect("Search highlights should appear");
+
+    // Now clear search using Command Palette
+    harness
+        .send_key(KeyCode::Char('p'), KeyModifiers::CONTROL)
+        .unwrap();
+    harness.render().unwrap();
+
+    harness.type_text("Clear Search").unwrap();
+    harness.render().unwrap();
+
+    harness
+        .send_key(KeyCode::Enter, KeyModifiers::NONE)
+        .unwrap();
+    harness.process_async_and_render().unwrap();
+
+    // Verify search highlights were cleared by checking active_state
+    harness
+        .wait_until(|h| h.count_search_highlights() == 0)
+        .expect("Search should be cleared");
+}

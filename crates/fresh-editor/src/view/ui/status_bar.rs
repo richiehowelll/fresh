@@ -171,6 +171,11 @@ impl RemoteIndicatorOverride {
 struct RenderedElement {
     text: String,
     kind: ElementKind,
+    /// For `ElementKind::Custom` elements, the plugin-registered token
+    /// key (`"<plugin>:<token>"`) — preserved here so the layout pass
+    /// can record this element's screen area under the same key for
+    /// click dispatch. `None` for every built-in element kind.
+    token_key: Option<String>,
 }
 
 /// Three-state LSP status used by the status bar `Lsp` element.
@@ -267,6 +272,18 @@ pub struct StatusBarLayout {
     /// Remote authority indicator area (row, start_col, end_col) - clickable
     /// to open the remote-authority context menu.
     pub remote_indicator: Option<(u16, u16, u16)>,
+    /// Plugin-registered status-bar token areas, keyed by the
+    /// `"<plugin_name>:<token_name>"` registry key (same key the
+    /// editor uses in `status_bar_token_registry`). Populated by the
+    /// renderer when it draws each plugin token. Mouse click dispatch
+    /// (`handle_click_status_bar`) walks this map after the built-in
+    /// indicators; on a hit, it fires the `status_bar_token_clicked`
+    /// hook so the plugin can react. This is what makes the env
+    /// pill, trust chip, and any future plugin chip first-class
+    /// affordances back to their decisions — see
+    /// `docs/internal/trust-env-devcontainer-ux-plan.md`
+    /// §"Path from here to the North Star".
+    pub plugin_token_areas: std::collections::HashMap<String, (u16, u16, u16)>,
 }
 
 /// Status bar hover state for styling clickable indicators
@@ -573,6 +590,36 @@ fn truncate_to_width(s: &str, max_width: usize) -> String {
 /// common single-digit case (the text is suffix-padded, not number-padded).
 const CURSOR_COL_RESERVE: usize = 3;
 
+/// Compute the cursor column as the number of grapheme clusters between the
+/// start of the cursor's line and the cursor. The line start is derived from
+/// the live cursor byte position (not a cached line number), so it stays
+/// correct in diff/split views where the two can disagree. Counting graphemes
+/// — rather than bytes or code points — keeps the reported column consistent
+/// with the editor's grapheme-based cursor movement.
+fn cursor_column(buffer: &mut crate::model::buffer::TextBuffer, cursor_position: usize) -> usize {
+    let mut iter = buffer.line_iterator(cursor_position, 80);
+    let line_start = iter.current_position();
+    let byte_col = cursor_position.saturating_sub(line_start);
+    if byte_col == 0 {
+        return 0;
+    }
+    // Prefer counting grapheme clusters over the line's text so multi-byte
+    // characters advance the column by one (issue #2090). Composite/diff
+    // buffers don't expose readable line content here; in that case fall back
+    // to the byte distance, which equals the grapheme count for the ASCII
+    // content those views render and matches the prior behavior.
+    match iter.next_line() {
+        Some((_, text)) if text.len() >= byte_col => {
+            let mut end = byte_col;
+            while end > 0 && !text.is_char_boundary(end) {
+                end -= 1;
+            }
+            crate::primitives::grapheme::grapheme_count(&text[..end])
+        }
+        _ => byte_col,
+    }
+}
+
 /// Format the cursor's `Ln X, Col Y` indicator so its rendered width is
 /// stable as the cursor moves. The numbers themselves are emitted with
 /// their natural width — preserving the format existing tests and screen-
@@ -858,7 +905,11 @@ impl StatusBarRenderer {
                 } else {
                     ElementKind::Normal
                 };
-                Some(RenderedElement { text, kind })
+                Some(RenderedElement {
+                    text,
+                    kind,
+                    token_key: None,
+                })
             }
             StatusBarElement::Cursor => {
                 if !ctx.state.show_cursors {
@@ -867,10 +918,8 @@ impl StatusBarRenderer {
                 let cursor = *ctx.cursors.primary();
                 let line_count = ctx.state.buffer.line_count();
                 let text = if let Some(lc) = line_count {
-                    let cursor_iter = ctx.state.buffer.line_iterator(cursor.position, 80);
-                    let line_start = cursor_iter.current_position();
-                    let col = cursor.position.saturating_sub(line_start);
                     let line = ctx.state.primary_cursor_line_number.value();
+                    let col = cursor_column(&mut ctx.state.buffer, cursor.position);
                     format_cursor_position(line + 1, col + 1, lc)
                 } else {
                     format!("Byte {}", cursor.position)
@@ -878,6 +927,7 @@ impl StatusBarRenderer {
                 Some(RenderedElement {
                     text,
                     kind: ElementKind::Normal,
+                    token_key: None,
                 })
             }
             StatusBarElement::CursorCompact => {
@@ -887,10 +937,8 @@ impl StatusBarRenderer {
                 let cursor = *ctx.cursors.primary();
                 let line_count = ctx.state.buffer.line_count();
                 let text = if let Some(lc) = line_count {
-                    let cursor_iter = ctx.state.buffer.line_iterator(cursor.position, 80);
-                    let line_start = cursor_iter.current_position();
-                    let col = cursor.position.saturating_sub(line_start);
                     let line = ctx.state.primary_cursor_line_number.value();
+                    let col = cursor_column(&mut ctx.state.buffer, cursor.position);
                     format_cursor_position_compact(line + 1, col + 1, lc)
                 } else {
                     format!("{}", cursor.position)
@@ -898,6 +946,7 @@ impl StatusBarRenderer {
                 Some(RenderedElement {
                     text,
                     kind: ElementKind::Normal,
+                    token_key: None,
                 })
             }
             StatusBarElement::Diagnostics => {
@@ -931,6 +980,7 @@ impl StatusBarRenderer {
                 Some(RenderedElement {
                     text: parts.join(" "),
                     kind: ElementKind::Normal,
+                    token_key: None,
                 })
             }
             StatusBarElement::CursorCount => {
@@ -940,6 +990,7 @@ impl StatusBarRenderer {
                 Some(RenderedElement {
                     text: t!("status.cursors", count = ctx.cursors.count()).to_string(),
                     kind: ElementKind::Normal,
+                    token_key: None,
                 })
             }
             StatusBarElement::Messages => {
@@ -960,6 +1011,7 @@ impl StatusBarRenderer {
                 Some(RenderedElement {
                     text: parts.join(" | "),
                     kind: ElementKind::Messages,
+                    token_key: None,
                 })
             }
             StatusBarElement::Chord => {
@@ -977,15 +1029,18 @@ impl StatusBarRenderer {
                 Some(RenderedElement {
                     text: format!("[{}]", chord_str),
                     kind: ElementKind::Normal,
+                    token_key: None,
                 })
             }
             StatusBarElement::LineEnding => Some(RenderedElement {
-                text: format!(" {} ", ctx.state.buffer.line_ending().display_name()),
+                text: ctx.state.buffer.line_ending().display_name().to_string(),
                 kind: ElementKind::LineEnding,
+                token_key: None,
             }),
             StatusBarElement::Encoding => Some(RenderedElement {
-                text: format!(" {} ", ctx.state.buffer.encoding().display_name()),
+                text: ctx.state.buffer.encoding().display_name().to_string(),
                 kind: ElementKind::Encoding,
+                token_key: None,
             }),
             StatusBarElement::Language => {
                 let text = if ctx.state.language == "text"
@@ -993,13 +1048,14 @@ impl StatusBarRenderer {
                     && ctx.state.display_name != "Plain Text"
                     && ctx.state.display_name != "text"
                 {
-                    format!(" {} [syntax only] ", &ctx.state.display_name)
+                    format!("{} [syntax only]", &ctx.state.display_name)
                 } else {
-                    format!(" {} ", &ctx.state.display_name)
+                    ctx.state.display_name.to_string()
                 };
                 Some(RenderedElement {
                     text,
                     kind: ElementKind::Language,
+                    token_key: None,
                 })
             }
             StatusBarElement::Lsp => {
@@ -1007,8 +1063,9 @@ impl StatusBarRenderer {
                     return None;
                 }
                 Some(RenderedElement {
-                    text: format!(" {} ", ctx.lsp_status),
+                    text: ctx.lsp_status.to_string(),
                     kind: ElementKind::Lsp,
+                    token_key: None,
                 })
             }
             StatusBarElement::Warnings => {
@@ -1016,15 +1073,17 @@ impl StatusBarRenderer {
                     return None;
                 }
                 Some(RenderedElement {
-                    text: format!(" [\u{26a0} {}] ", ctx.general_warning_count),
+                    text: format!("[\u{26a0} {}]", ctx.general_warning_count),
                     kind: ElementKind::WarningBadge,
+                    token_key: None,
                 })
             }
             StatusBarElement::Update => {
                 let version = ctx.update_available?;
                 Some(RenderedElement {
-                    text: format!(" {} ", t!("status.update_available", version = version)),
+                    text: t!("status.update_available", version = version).to_string(),
                     kind: ElementKind::Update,
+                    token_key: None,
                 })
             }
             StatusBarElement::Palette => {
@@ -1036,8 +1095,9 @@ impl StatusBarRenderer {
                     )
                     .unwrap_or_else(|| "?".to_string());
                 Some(RenderedElement {
-                    text: format!(" {} ", t!("status.palette", shortcut = shortcut)),
+                    text: t!("status.palette", shortcut = shortcut).to_string(),
                     kind: ElementKind::Palette,
+                    token_key: None,
                 })
             }
             StatusBarElement::Clock => {
@@ -1046,6 +1106,7 @@ impl StatusBarRenderer {
                 Some(RenderedElement {
                     text,
                     kind: ElementKind::Clock,
+                    token_key: None,
                 })
             }
             StatusBarElement::RemoteIndicator => {
@@ -1059,19 +1120,20 @@ impl StatusBarRenderer {
                 // derived state. The override carries its own label;
                 // derived states synthesize one from `remote_connection`.
                 let (text, state) = if let Some(over) = ctx.remote_state_override {
-                    (format!(" {} ", over.label()), over.state())
+                    (over.label(), over.state())
                 } else {
                     match ctx.remote_connection {
-                        None => (" Local ".to_string(), RemoteIndicatorState::Local),
+                        None => ("Local".to_string(), RemoteIndicatorState::Local),
                         Some(conn) if conn.contains("(Disconnected)") => {
-                            (format!(" {} ", conn), RemoteIndicatorState::Disconnected)
+                            (conn.to_string(), RemoteIndicatorState::Disconnected)
                         }
-                        Some(conn) => (format!(" {} ", conn), RemoteIndicatorState::Connected),
+                        Some(conn) => (conn.to_string(), RemoteIndicatorState::Connected),
                     }
                 };
                 Some(RenderedElement {
                     text,
                     kind: ElementKind::RemoteIndicator(state),
+                    token_key: None,
                 })
             }
             StatusBarElement::CustomToken(key) => {
@@ -1079,6 +1141,7 @@ impl StatusBarRenderer {
                     Some(RenderedElement {
                         text: value.clone(),
                         kind: ElementKind::Custom,
+                        token_key: Some(key.clone()),
                     })
                 } else {
                     None // Skip rendering if no value set
@@ -1237,10 +1300,16 @@ impl StatusBarRenderer {
         }
     }
 
-    /// Map an ElementKind to the layout field it should populate.
+    /// Map a rendered element to the layout field(s) it should populate.
+    /// Built-in indicators get their dedicated `Option<(row, start_col,
+    /// end_col)>` slot. Plugin tokens (`ElementKind::Custom` carrying a
+    /// `token_key`) get an entry in `plugin_token_areas`, keyed by the
+    /// plugin's registry key — that's what `handle_click_status_bar`
+    /// uses to dispatch clicks back to the right plugin.
     fn update_layout_for_element(
         layout: &mut StatusBarLayout,
         kind: ElementKind,
+        token_key: Option<&str>,
         row: u16,
         start_col: u16,
         end_col: u16,
@@ -1256,6 +1325,13 @@ impl StatusBarRenderer {
             ElementKind::Messages => layout.message_area = Some((row, start_col, end_col)),
             ElementKind::RemoteIndicator(_) => {
                 layout.remote_indicator = Some((row, start_col, end_col))
+            }
+            ElementKind::Custom => {
+                if let Some(key) = token_key {
+                    layout
+                        .plugin_token_areas
+                        .insert(key.to_string(), (row, start_col, end_col));
+                }
             }
             _ => {}
         }
@@ -1275,7 +1351,11 @@ impl StatusBarRenderer {
         let base_style = Style::default()
             .fg(theme.status_bar_fg)
             .bg(theme.status_bar_bg);
-        let width = str_width(&rendered.text);
+        // Each entry carries a one-space margin on each side painted in its own
+        // style, so entries with a distinct background (LSP / warnings / update
+        // / palette / remote) render as a padded pill. The separator is then a
+        // bare glyph drawn between these padded entries.
+        let width = str_width(&rendered.text) + 2;
 
         if rendered.kind == ElementKind::RemoteDisconnected && rendered.text.starts_with(SSH_PREFIX)
         {
@@ -1288,37 +1368,51 @@ impl StatusBarRenderer {
                 let rest = rendered.text[split_at..].to_string();
                 return (
                     vec![
+                        Span::styled(" ", error_style),
                         Span::styled(prefix, error_style),
                         Span::styled(rest, base_style),
+                        Span::styled(" ", base_style),
                     ],
                     width,
                 );
             }
             return (
-                vec![Span::styled(rendered.text.clone(), error_style)],
+                vec![
+                    Span::styled(" ", error_style),
+                    Span::styled(rendered.text.clone(), error_style),
+                    Span::styled(" ", error_style),
+                ],
                 width,
             );
         }
 
         let style = Self::element_style(rendered.kind, theme, hover, warning_level, lsp_state);
-        let spans = if rendered.kind == ElementKind::Clock {
+        let mut spans = vec![Span::styled(" ", style)];
+        if rendered.kind == ElementKind::Clock {
             // "HH:MM" — blink the colon via terminal hardware (SGR 5)
-            vec![
-                Span::styled(rendered.text[..2].to_string(), style),
-                Span::styled(":".to_string(), style.add_modifier(Modifier::SLOW_BLINK)),
-                Span::styled(rendered.text[3..].to_string(), style),
-            ]
+            spans.push(Span::styled(rendered.text[..2].to_string(), style));
+            spans.push(Span::styled(
+                ":".to_string(),
+                style.add_modifier(Modifier::SLOW_BLINK),
+            ));
+            spans.push(Span::styled(rendered.text[3..].to_string(), style));
         } else {
-            vec![Span::styled(rendered.text.clone(), style)]
-        };
+            spans.push(Span::styled(rendered.text.clone(), style));
+        }
+        spans.push(Span::styled(" ", style));
         (spans, width)
     }
 
     /// Render a configured side (left/right) into styled per-element groups.
+    /// Each tuple carries the rendered spans, total width, the kind tag
+    /// (for layout/click-area routing of built-ins), and the plugin
+    /// token key (`Some` only for `ElementKind::Custom`) so the
+    /// placement loops can record the screen area under the same key
+    /// the plugin registered.
     fn render_side(
         config_side: &[StatusBarElement],
         ctx: &mut StatusBarContext<'_>,
-    ) -> Vec<(Vec<Span<'static>>, usize, ElementKind)> {
+    ) -> Vec<(Vec<Span<'static>>, usize, ElementKind, Option<String>)> {
         let rendered: Vec<RenderedElement> = config_side
             .iter()
             .filter_map(|elem| Self::render_element(elem, ctx))
@@ -1333,9 +1427,10 @@ impl StatusBarRenderer {
             .into_iter()
             .map(|r| {
                 let kind = r.kind;
+                let token_key = r.token_key.clone();
                 let (spans, width) =
                     Self::element_spans(&r, theme, hover, warning_level, lsp_state);
-                (spans, width, kind)
+                (spans, width, kind, token_key)
             })
             .collect()
     }
@@ -1370,8 +1465,15 @@ impl StatusBarRenderer {
         let left_items = Self::render_side(&config.left, ctx);
         let mut right_items = Self::render_side(&config.right, ctx);
 
-        const SEPARATOR: &str = " | ";
-        let separator_width = str_width(SEPARATOR);
+        // Separator drawn between elements, used verbatim from config.
+        // An empty value disables separators and consumes no width.
+        let separator: &str = &config.separator;
+        let separator_width = str_width(separator);
+        // The separator glyph is colored by the theme's dedicated separator
+        // keys so it can be dimmed against the bar; both fall back to the bar.
+        let separator_style = Style::default()
+            .fg(ctx.theme.status_separator_fg)
+            .bg(ctx.theme.status_separator_bg);
 
         // Reserve a sane minimum for the left side so the buffer name and
         // cursor position aren't truncated to a single character on narrow
@@ -1381,7 +1483,8 @@ impl StatusBarRenderer {
         // alongside that minimum left budget.  We never drop the *first*
         // right element so the user keeps at least one piece of right-side
         // status if any was configured.
-        let total_right_width: usize = right_items.iter().map(|(_, w, _)| *w).sum();
+        let total_right_width: usize = right_items.iter().map(|(_, w, _, _)| *w).sum::<usize>()
+            + separator_width * right_items.len().saturating_sub(1);
         let left_min_target = available_width
             .saturating_mul(2)
             .saturating_div(5) // ~40% of width reserved for left when feasible
@@ -1392,13 +1495,17 @@ impl StatusBarRenderer {
             while current > right_budget && right_items.len() > 1 {
                 if let Some(dropped) = right_items.pop() {
                     current = current.saturating_sub(dropped.1);
+                    // Also remove the separator that preceded the dropped
+                    // element (always present since we never drop the first)
+                    current = current.saturating_sub(separator_width);
                 } else {
                     break;
                 }
             }
         }
 
-        let right_width: usize = right_items.iter().map(|(_, w, _)| *w).sum();
+        let right_width: usize = right_items.iter().map(|(_, w, _, _)| *w).sum::<usize>()
+            + separator_width * right_items.len().saturating_sub(1);
 
         let narrow = available_width < 15;
         let left_max_width = if narrow {
@@ -1415,13 +1522,13 @@ impl StatusBarRenderer {
         let mut spans: Vec<Span<'static>> = Vec::new();
         let mut used_left: usize = 0;
 
-        for (idx, (item_spans, width, kind)) in left_items.into_iter().enumerate() {
+        for (idx, (item_spans, width, kind, token_key)) in left_items.into_iter().enumerate() {
             let sep_width = if idx == 0 { 0 } else { separator_width };
             if used_left + sep_width >= left_max_width {
                 break;
             }
             if sep_width > 0 {
-                spans.push(Span::styled(SEPARATOR, base_style));
+                spans.push(Span::styled(separator.to_string(), separator_style));
                 used_left += sep_width;
             }
 
@@ -1435,6 +1542,7 @@ impl StatusBarRenderer {
                 Self::update_layout_for_element(
                     &mut layout,
                     kind,
+                    token_key.as_deref(),
                     area.y,
                     area.x + start_col as u16,
                     area.x + (start_col + width) as u16,
@@ -1459,6 +1567,7 @@ impl StatusBarRenderer {
                 Self::update_layout_for_element(
                     &mut layout,
                     kind,
+                    token_key.as_deref(),
                     area.y,
                     area.x + start_col as u16,
                     area.x + (start_col + truncated_width) as u16,
@@ -1489,10 +1598,15 @@ impl StatusBarRenderer {
         }
 
         let mut current_col = area.x + col_offset as u16;
-        for (item_spans, width, kind) in right_items {
+        for (idx, (item_spans, width, kind, token_key)) in right_items.into_iter().enumerate() {
+            if idx > 0 && separator_width > 0 {
+                spans.push(Span::styled(separator.to_string(), separator_style));
+                current_col += separator_width as u16;
+            }
             Self::update_layout_for_element(
                 &mut layout,
                 kind,
+                token_key.as_deref(),
                 area.y,
                 current_col,
                 current_col + width as u16,
@@ -2117,6 +2231,40 @@ mod tests {
     }
 
     #[test]
+    fn test_status_separator_keys_default_and_override() {
+        // The separator glyph is painted by dedicated theme keys so it can
+        // be dimmed against the bar. By default both resolve to the
+        // status-bar palette, keeping the bar a single continuous color.
+        let theme = crate::view::theme::Theme::from_json(
+            r#"{"name":"t","editor":{},"ui":{},"search":{},"diagnostic":{},"syntax":{}}"#,
+        )
+        .expect("minimal theme should parse");
+        assert_eq!(theme.status_separator_fg, theme.status_bar_fg);
+        assert_eq!(theme.status_separator_bg, theme.status_bar_bg);
+
+        // A theme that sets only the separator keys repaints the glyph
+        // without touching the rest of the bar.
+        let theme = crate::view::theme::Theme::from_json(
+            r#"{
+                "name":"t",
+                "editor":{},
+                "ui":{
+                    "status_bar_fg":"White",
+                    "status_bar_bg":"DarkGray",
+                    "status_separator_fg":"Gray",
+                    "status_separator_bg":"Black"
+                },
+                "search":{},
+                "diagnostic":{},
+                "syntax":{}
+            }"#,
+        )
+        .expect("theme should parse");
+        assert_ne!(theme.status_separator_fg, theme.status_bar_fg);
+        assert_ne!(theme.status_separator_bg, theme.status_bar_bg);
+    }
+
+    #[test]
     fn test_remote_indicator_override_state_projection() {
         assert_eq!(
             RemoteIndicatorOverride::Local.state(),
@@ -2235,5 +2383,62 @@ mod tests {
         let top = format_cursor_position(1, 1, 10_000);
         let high = format_cursor_position(9_999, 999, 10_000);
         assert_eq!(top.len(), high.len());
+    }
+
+    #[test]
+    fn test_cursor_column_counts_chars_not_bytes() {
+        let mut buf =
+            crate::model::buffer::TextBuffer::from_str_test("hello\ncafé résumé\nworld\n");
+        let line_start = buf.line_start_offset(1).unwrap();
+
+        // 'r' starts at byte 6 ("café " = 5 chars / 6 bytes), char column 5.
+        let col = cursor_column(&mut buf, line_start + 6);
+        assert_eq!(
+            col, 5,
+            "cursor at 'r' should be column 5, not byte offset 6"
+        );
+
+        // 'é' starts at byte 3 (after "caf"), column 3.
+        let col = cursor_column(&mut buf, line_start + 3);
+        assert_eq!(col, 3, "cursor at 'é' should be column 3");
+
+        // 'u' in "résumé" sits at byte 10, column 8.
+        let col = cursor_column(&mut buf, line_start + 10);
+        assert_eq!(col, 8, "cursor at 'u' should be column 8");
+    }
+
+    #[test]
+    fn test_cursor_column_counts_grapheme_clusters() {
+        // Line 1 is "e + combining acute" followed by 'x'. The accented 'e' is
+        // two code points but one grapheme; counting graphemes (not chars or
+        // bytes) keeps the column aligned with grapheme-based cursor movement.
+        let mut buf = crate::model::buffer::TextBuffer::from_str_test("ab\ne\u{0301}x\n");
+        let line_start = buf.line_start_offset(1).unwrap();
+
+        // 'x' sits after the 1-byte 'e' and 2-byte combining accent (byte 3),
+        // which is char column 2 but grapheme column 1.
+        let col = cursor_column(&mut buf, line_start + 3);
+        assert_eq!(
+            col, 1,
+            "accented 'e' is one grapheme; 'x' should be column 1, not 2"
+        );
+    }
+
+    #[test]
+    fn test_cursor_column_zwj_emoji_is_one_grapheme() {
+        // Family emoji is several code points joined by ZWJ but a single
+        // grapheme cluster (18 bytes).
+        let mut buf = crate::model::buffer::TextBuffer::from_str_test("👨\u{200D}👩\u{200D}👧z\n");
+        let line_start = buf.line_start_offset(0).unwrap();
+
+        let col = cursor_column(&mut buf, line_start + 18);
+        assert_eq!(col, 1, "ZWJ family emoji should count as one column");
+    }
+
+    #[test]
+    fn test_cursor_column_at_line_start_is_zero() {
+        let mut buf = crate::model::buffer::TextBuffer::from_str_test("hello\nworld\n");
+        let line_start = buf.line_start_offset(1).unwrap();
+        assert_eq!(cursor_column(&mut buf, line_start), 0);
     }
 }

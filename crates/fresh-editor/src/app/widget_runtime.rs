@@ -544,7 +544,7 @@ impl Editor {
             .map(|s| s.to_string())
             .unwrap_or_default();
         if old_key == new_key {
-            tracing::warn!(
+            tracing::debug!(
                 target: "fresh::dock",
                 panel_id,
                 key = %new_key,
@@ -552,7 +552,7 @@ impl Editor {
             );
             return;
         }
-        tracing::warn!(
+        tracing::debug!(
             target: "fresh::dock",
             panel_id,
             old = %old_key,
@@ -975,11 +975,21 @@ impl Editor {
             );
         }
         self.rerender_widget_panel(panel_id);
-        if self
-            .plugin_manager
-            .read()
-            .unwrap()
-            .has_hook_handlers("widget_event")
+        // A clamped move at the list's top/bottom edge leaves the
+        // selection where it was. Still re-render above (re-arming
+        // `user_scrolled = false` snaps a scrolled-away view back to the
+        // selection), but don't fire a `select` event for a no-op move:
+        // holding ↑/↓ against the boundary would otherwise spam the
+        // plugin with same-index selections — each one re-runs the
+        // plugin's preview / live-switch work (in the Orchestrator dock
+        // it schedules a redundant `scheduleDockSwitch`). Mirrors the
+        // Tree handler's "No change → bail (don't fire spurious select)".
+        if new_sel != cur_sel
+            && self
+                .plugin_manager
+                .read()
+                .unwrap()
+                .has_hook_handlers("widget_event")
         {
             self.plugin_manager.read().unwrap().run_hook(
                 "widget_event",
@@ -1649,16 +1659,31 @@ impl Editor {
         buffer_id: crate::model::event::BufferId,
     ) -> Option<u64> {
         for panel_id in self.widget_registry.panels_for_buffer(buffer_id) {
-            let panel = self.widget_registry.get(panel_id)?;
-            if panel.focus_key.is_empty() {
-                continue;
-            }
-            let widget = crate::widgets::find_widget_by_key(&panel.spec, &panel.focus_key);
-            if matches!(widget, Some(fresh_core::api::WidgetSpec::Text { .. })) {
+            if self.panel_focused_widget_is_text(panel_id) {
                 return Some(panel_id);
             }
         }
         None
+    }
+
+    /// True when `panel_id`'s currently-focused widget is a `Text`
+    /// field (so it can accept clipboard insertion). `false` when the
+    /// panel is gone, has no focus, or focus rests on a non-text
+    /// widget (`Button` / `List` / `Toggle` / …). This is the shared
+    /// predicate behind both the buffer-mounted paste routing
+    /// (`focused_text_widget_panel_for_buffer`) and the floating-panel
+    /// bracketed-paste routing (`paste_bracketed_into_focused_panel`).
+    pub(super) fn panel_focused_widget_is_text(&self, panel_id: u64) -> bool {
+        let Some(panel) = self.widget_registry.get(panel_id) else {
+            return false;
+        };
+        if panel.focus_key.is_empty() {
+            return false;
+        }
+        matches!(
+            crate::widgets::find_widget_by_key(&panel.spec, &panel.focus_key),
+            Some(fresh_core::api::WidgetSpec::Text { .. })
+        )
     }
 
     /// Read the currently-selected text from the focused `Text`
@@ -1940,7 +1965,7 @@ impl Editor {
             .get(panel_id)
             .map(|p| p.focus_key.clone())
             .unwrap_or_default();
-        tracing::warn!(
+        tracing::debug!(
             target: "fresh::dock",
             panel_id,
             ?slot,
@@ -1978,7 +2003,7 @@ impl Editor {
         if let Some(f) = self.panel_mut(slot) {
             f.focused = false;
         }
-        tracing::warn!(
+        tracing::debug!(
             target: "fresh::dock",
             panel_id,
             ?slot,

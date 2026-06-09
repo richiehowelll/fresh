@@ -1435,3 +1435,160 @@ editor.setStatus("Uppercase plugin loaded");
         screen
     );
 }
+
+#[test]
+fn test_plugin_has_active_search() {
+    let temp_dir = tempfile::TempDir::new().unwrap();
+    let project_root = temp_dir.path().join("project_root");
+    fs::create_dir(&project_root).unwrap();
+
+    let plugins_dir = project_root.join("plugins");
+    fs::create_dir(&plugins_dir).unwrap();
+    copy_plugin_lib(&plugins_dir);
+
+    // Create a simple plugin that provides a command to query hasActiveSearch()
+    let test_plugin = r###"
+const editor = getEditor();
+
+globalThis.test_has_active_search = function(): void {
+    let isActive = editor.hasActiveSearch();
+    editor.insertAtCursor(`[SearchActive=${isActive}]`);
+};
+
+editor.registerCommand(
+    "Test: Verify Active Search",
+    "Check if search is active",
+    "test_has_active_search",
+    null
+);
+"###;
+
+    let test_plugin_path = plugins_dir.join("test_search_plugin.ts");
+    fs::write(&test_plugin_path, test_plugin).unwrap();
+
+    let test_file_content = "hello world\nfoo bar\nhello again\nbaz\n";
+    let test_file_path = project_root.join("test.txt");
+    fs::write(&test_file_path, test_file_content).unwrap();
+
+    let mut harness =
+        EditorTestHarness::with_config_and_working_dir(80, 24, Config::default(), project_root)
+            .unwrap();
+
+    harness.open_file(&test_file_path).unwrap();
+    harness.process_async_and_render().unwrap();
+
+    // Check initial state
+    // Wait until the command is registered by the plugin
+    harness
+        .wait_until(|h| {
+            h.editor()
+                .command_registry()
+                .read()
+                .unwrap()
+                .find_by_name("Test: Verify Active Search")
+                .is_some()
+        })
+        .expect("Wait for plugin to register command");
+
+    harness
+        .send_key(KeyCode::Char('p'), KeyModifiers::CONTROL)
+        .unwrap();
+    harness.process_async_and_render().unwrap();
+    harness.type_text("Test: Verify Active Search").unwrap();
+    harness.process_async_and_render().unwrap();
+    harness
+        .send_key(KeyCode::Enter, KeyModifiers::NONE)
+        .unwrap();
+
+    harness
+        .wait_until(|h| h.screen_to_string().contains("[SearchActive=false]"))
+        .expect("Command 1");
+
+    // Trigger search
+    harness
+        .send_key(KeyCode::Char('f'), KeyModifiers::CONTROL)
+        .unwrap();
+    harness.process_async_and_render().unwrap();
+    harness.type_text("hello").unwrap();
+    harness.process_async_and_render().unwrap();
+    harness
+        .send_key(KeyCode::Enter, KeyModifiers::NONE)
+        .unwrap();
+    harness.process_async_and_render().unwrap();
+
+    // IMPORTANT: Wait for the search to actually take effect before
+    // querying it. Observe the rendered match highlight rather than a
+    // status-bar string: the status bar truncates unpredictably at narrow
+    // widths (the old "Found 2 matches" → "F..." truncation depended on
+    // the now-removed " | " separator), and e2e tests must assert on
+    // rendered output, not model accessors (CONTRIBUTING.md). A search
+    // applies the theme's `search.match_bg` to each matched "hello", so
+    // the matched cells carry a background distinct from the unmatched
+    // text after them on the same row — a color-independent signal that
+    // only appears once the search has run.
+    harness
+        .wait_until(|h| {
+            let buffer = h.buffer();
+            let (width, height) = (buffer.area.width, buffer.area.height);
+            // Rows 0-1 are the menu/tab bar; scan content rows only.
+            (2..height).any(|y| {
+                (0..width.saturating_sub(8)).any(|x| {
+                    let spells_hello = ["h", "e", "l", "l", "o"]
+                        .iter()
+                        .enumerate()
+                        .all(|(i, c)| h.get_cell(x + i as u16, y).as_deref() == Some(*c));
+                    if !spells_hello {
+                        return false;
+                    }
+                    // "hello" is highlighted; the 'w' of "world" (or 'a' of
+                    // "again") two cells past the match's end is not.
+                    let match_bg = h.get_cell_style(x, y).and_then(|s| s.bg);
+                    let after_bg = h.get_cell_style(x + 6, y).and_then(|s| s.bg);
+                    match_bg.is_some() && match_bg != after_bg
+                })
+            })
+        })
+        .expect("Wait for search highlights");
+
+    // Verify search is active
+    harness
+        .send_key(KeyCode::Char('p'), KeyModifiers::CONTROL)
+        .unwrap();
+    harness.process_async_and_render().unwrap();
+    harness.type_text("Test: Verify Active Search").unwrap();
+    harness.process_async_and_render().unwrap();
+    harness
+        .send_key(KeyCode::Enter, KeyModifiers::NONE)
+        .unwrap();
+
+    harness
+        .wait_until(|h| h.screen_to_string().contains("[SearchActive=true]"))
+        .expect("Command 2");
+
+    // Clear search
+    harness
+        .send_key(KeyCode::Char('p'), KeyModifiers::CONTROL)
+        .unwrap();
+    harness.process_async_and_render().unwrap();
+    harness.type_text("Clear Search Highlights").unwrap();
+    harness.process_async_and_render().unwrap();
+    harness
+        .send_key(KeyCode::Enter, KeyModifiers::NONE)
+        .unwrap();
+    harness.process_async_and_render().unwrap();
+
+    // Verify search is inactive again
+    harness
+        .send_key(KeyCode::Char('p'), KeyModifiers::CONTROL)
+        .unwrap();
+    harness.process_async_and_render().unwrap();
+    harness.type_text("Test: Verify Active Search").unwrap();
+    harness.process_async_and_render().unwrap();
+    harness
+        .send_key(KeyCode::Enter, KeyModifiers::NONE)
+        .unwrap();
+
+    harness
+        .wait_until(|h| h.screen_to_string().contains("[SearchActive=false]"))
+        .expect("Command 3");
+}

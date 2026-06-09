@@ -58,6 +58,11 @@ pub struct RemoteAttachReady {
     pub working_dir: Option<std::path::PathBuf>,
     /// Restart (global) vs. born-attached new window.
     pub mode: RemoteAttachMode,
+    /// JS callback id of the `attachRemoteAgent` promise to settle once the
+    /// session (authority + window) is fully constructed. The main loop
+    /// resolves it on success and rejects it if window creation fails, so the
+    /// plugin's dialog only closes when there is a real session to show.
+    pub request_id: u64,
 }
 
 impl std::fmt::Debug for RemoteAttachReady {
@@ -75,9 +80,10 @@ pub enum AsyncMessage {
     /// authority + keepalive and restart.
     RemoteAttachReady(RemoteAttachReady),
 
-    /// An async `attachRemoteAgent` connect failed — surface the error;
-    /// the editor stays on its current authority.
-    RemoteAttachFailed { error: String },
+    /// An async `attachRemoteAgent` connect failed — reject the plugin's
+    /// promise with `error` (the plugin shows it and creates no window); the
+    /// editor stays on its current authority.
+    RemoteAttachFailed { error: String, request_id: u64 },
 
     /// LSP diagnostics received for a file
     LspDiagnostics {
@@ -244,8 +250,14 @@ pub enum AsyncMessage {
     /// Git status updated (future: git integration)
     GitStatusChanged { status: String },
 
-    /// File explorer initialized with tree view
-    FileExplorerInitialized(FileTreeView),
+    /// File explorer initialized with tree view. Carries the id of the window
+    /// that requested it: a background preview/materialize can init a
+    /// *non-active* window's explorer, so the view must land on that window —
+    /// applying it to whatever is active would clobber an unrelated explorer.
+    FileExplorerInitialized {
+        window: fresh_core::WindowId,
+        view: FileTreeView,
+    },
 
     /// File explorer node toggle completed
     FileExplorerToggleNode(NodeId),
@@ -253,9 +265,13 @@ pub enum AsyncMessage {
     /// File explorer node refresh completed
     FileExplorerRefreshNode(NodeId),
 
-    /// File explorer expand to path completed
-    /// Contains the updated FileTreeView with the path expanded and selected
-    FileExplorerExpandedToPath(FileTreeView),
+    /// File explorer expand to path completed. Carries the requesting window id
+    /// (see `FileExplorerInitialized`) so the expanded view returns to its own
+    /// window rather than the active one.
+    FileExplorerExpandedToPath {
+        window: fresh_core::WindowId,
+        view: FileTreeView,
+    },
 
     /// Plugin-related async messages
     Plugin(fresh_core::api::PluginAsyncMessage),

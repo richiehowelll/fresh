@@ -151,6 +151,7 @@ pub struct PartialEditorConfig {
     pub scroll_offset: Option<usize>,
     pub syntax_highlighting: Option<bool>,
     pub highlight_current_line: Option<bool>,
+    pub highlight_occurrences: Option<bool>,
     pub highlight_current_column: Option<bool>,
     pub line_wrap: Option<bool>,
     pub wrap_indent: Option<bool>,
@@ -416,6 +417,7 @@ pub struct PartialTerminalConfig {
     pub jump_to_end_on_output: Option<bool>,
     pub shell: Option<crate::config::TerminalShellConfig>,
     pub skip_app_execution_alias: Option<bool>,
+    pub resume_agents: Option<bool>,
 }
 
 impl Merge for PartialTerminalConfig {
@@ -425,6 +427,7 @@ impl Merge for PartialTerminalConfig {
         self.shell.merge_from(&other.shell);
         self.skip_app_execution_alias
             .merge_from(&other.skip_app_execution_alias);
+        self.resume_agents.merge_from(&other.resume_agents);
     }
 }
 
@@ -519,6 +522,7 @@ pub struct PartialLanguageConfig {
     pub format_on_save: Option<bool>,
     pub on_save: Option<Vec<OnSaveAction>>,
     pub word_characters: Option<Option<String>>,
+    pub indent: Option<crate::config::IndentRulesConfig>,
 }
 
 impl Merge for PartialLanguageConfig {
@@ -543,6 +547,7 @@ impl Merge for PartialLanguageConfig {
         self.format_on_save.merge_from(&other.format_on_save);
         self.on_save.merge_from(&other.on_save);
         self.word_characters.merge_from(&other.word_characters);
+        self.indent.merge_from(&other.indent);
     }
 }
 
@@ -563,6 +568,7 @@ impl From<&crate::config::EditorConfig> for PartialEditorConfig {
             scroll_offset: Some(cfg.scroll_offset),
             syntax_highlighting: Some(cfg.syntax_highlighting),
             highlight_current_line: Some(cfg.highlight_current_line),
+            highlight_occurrences: Some(cfg.highlight_occurrences),
             highlight_current_column: Some(cfg.highlight_current_column),
             line_wrap: Some(cfg.line_wrap),
             wrap_indent: Some(cfg.wrap_indent),
@@ -659,6 +665,9 @@ impl PartialEditorConfig {
             highlight_current_line: self
                 .highlight_current_line
                 .unwrap_or(defaults.highlight_current_line),
+            highlight_occurrences: self
+                .highlight_occurrences
+                .unwrap_or(defaults.highlight_occurrences),
             highlight_current_column: self
                 .highlight_current_column
                 .unwrap_or(defaults.highlight_current_column),
@@ -897,6 +906,7 @@ impl From<&TerminalConfig> for PartialTerminalConfig {
             jump_to_end_on_output: Some(cfg.jump_to_end_on_output),
             shell: cfg.shell.clone(),
             skip_app_execution_alias: Some(cfg.skip_app_execution_alias),
+            resume_agents: Some(cfg.resume_agents),
         }
     }
 }
@@ -911,6 +921,7 @@ impl PartialTerminalConfig {
             skip_app_execution_alias: self
                 .skip_app_execution_alias
                 .unwrap_or(defaults.skip_app_execution_alias),
+            resume_agents: self.resume_agents.unwrap_or(defaults.resume_agents),
         }
     }
 }
@@ -998,6 +1009,7 @@ impl From<&LanguageConfig> for PartialLanguageConfig {
             format_on_save: Some(cfg.format_on_save),
             on_save: Some(cfg.on_save.clone()),
             word_characters: Some(cfg.word_characters.clone()),
+            indent: cfg.indent.clone(),
         }
     }
 }
@@ -1034,6 +1046,7 @@ impl PartialLanguageConfig {
             word_characters: self
                 .word_characters
                 .unwrap_or_else(|| defaults.word_characters.clone()),
+            indent: self.indent.or_else(|| defaults.indent.clone()),
         }
     }
 }
@@ -1231,7 +1244,7 @@ impl PartialConfig {
             result
         };
 
-        crate::config::Config {
+        let mut config = crate::config::Config {
             version: self.version.unwrap_or(defaults.version),
             theme: self.theme.unwrap_or_else(|| defaults.theme.clone()),
             locale: crate::config::LocaleName::from(
@@ -1280,7 +1293,11 @@ impl PartialConfig {
                 .packages
                 .map(|e| e.resolve(&defaults.packages))
                 .unwrap_or_else(|| defaults.packages.clone()),
-        }
+        };
+        // Treat `0` as "not set" for numeric settings where a literal zero is
+        // meaningless (wrap_column, page_width, tab_size).
+        config.normalize_zero_sentinels();
+        config
     }
 }
 
@@ -1307,6 +1324,7 @@ impl Default for LanguageConfig {
             format_on_save: false,
             on_save: Vec::new(),
             word_characters: None,
+            indent: None,
         }
     }
 }

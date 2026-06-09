@@ -241,11 +241,13 @@ interface NewSessionForm {
   // which field set `buildFormSpec` renders and which submit path runs.
   backend: SessionBackend;
   // --- SSH backend fields (rendered only when backend === "ssh") ---
-  // Host as `user@host[:port]` (also accepts a pasted `ssh://…`); remote path
-  // to root the session at; optional identity file.
+  // Host as `host`, `user@host[:port]`, or a pasted `ssh://…` (user optional);
+  // remote path to root the session at; optional identity file; and free-form
+  // extra ssh arguments (e.g. `-J jump`, `-o ProxyCommand=…`).
   sshHost: { value: string; cursor: number };
   sshPath: { value: string; cursor: number };
   sshIdentity: { value: string; cursor: number };
+  sshOptions: { value: string; cursor: number };
   // --- Kubernetes backend fields (rendered only when backend ===
   // "kubernetes") ---. `k8sTarget` names a target from `.fresh/k8s.json`;
   // when empty, the explicit context/namespace/pod/workspace fields are used
@@ -306,14 +308,6 @@ interface NewSessionForm {
   // placeholder as `HEAD  (no origin configured)` so the user
   // knows why.
   defaultBranchIsHeadFallback: boolean;
-  // Previously-submitted Agent Command (persisted across editor
-  // sessions via `orchestrator.last_cmd`). Rendered as the cmd
-  // field's *placeholder*, and used as the actual command when
-  // the user leaves the field blank — submitting "" with a
-  // visible placeholder of "python3" was confusing because the
-  // host ignored the hint and spawned a bare shell. Now the
-  // placeholder is the command if the value is empty.
-  lastCmd: string;
   // True when this form was opened from the picker (Alt+N or
   // the "+ New Session" button). On cancel (Esc / Cancel
   // button) we re-open the picker so the user lands back where
@@ -469,6 +463,12 @@ interface OpenDialogState {
   projectFilter: string | null;
   // `true` while the dock project dropdown overlay is open.
   projectMenuOpen: boolean;
+  // Keyboard cursor (highlighted row) within the open project
+  // dropdown, indexing `projectMenuKeys()` (0 = "All projects").
+  // Distinct from `projectFilter`, which is the *applied* scope shown
+  // with a `●`; this is just where ↑/↓ currently sit before Enter
+  // commits. Only meaningful while `projectMenuOpen`.
+  projectMenuIndex: number;
 }
 let openDialog: OpenDialogState | null = null;
 let openPanel: FloatingWidgetPanel | null = null;
@@ -492,6 +492,25 @@ let dockBlurred = false;
 // Monotonic token so a rapid run of ↑/↓ only commits the *last*
 // selection after the debounce window (30ms) — see `scheduleDockSwitch`.
 let dockSwitchToken = 0;
+// Right-click context menu for a dock session row. At `stage: "menu"`
+// it's an unobtrusive content-sized popup anchored at the click (no
+// background dim) offering Visit / Archive / Delete against one session.
+// Choosing Archive/Delete swaps the SAME panel to a centered, dimmed
+// `stage: "confirm"` modal (the destructive actions require a
+// confirmation), reusing `buildConfirmPane`. Visit acts immediately.
+// `anchorCol`/`anchorRow` are the right-click cell, kept so a return
+// from confirm→menu (Cancel) re-anchors the popup where it opened.
+type DockMenuState =
+  | { sessionId: number; anchorCol: number; anchorRow: number; stage: "menu" }
+  | {
+      sessionId: number;
+      anchorCol: number;
+      anchorRow: number;
+      stage: "confirm";
+      action: "archive" | "delete";
+    };
+let dockMenuPanel: FloatingWidgetPanel | null = null;
+let dockMenuState: DockMenuState | null = null;
 // Default dock width on a "typical" terminal, and the bounds the
 // responsive width is clamped to. The dock scales with the terminal
 // (`dockDefaultWidth`) between these; a user drag still overrides it
@@ -964,7 +983,14 @@ function filterSessions(needle: string): number[] {
     const activeId = editor.activeWindow();
     allIds = allIds.filter((id) => {
       const s = orchestratorSessions.get(id)!;
-      if (s.discovered || id === activeId) return true;
+      // Keep: the active session (you must see where you are), discovered
+      // worktree rows (their own toggle governs them), and any remote
+      // (SSH / k8s) session. A remote session is a live connection, never an
+      // "empty restored shell" — and its persisted workspace records no local
+      // terminal, so it looked trivial and got dropped the instant it stopped
+      // being the active card. In the dock (a live switcher) that made the
+      // first card vanish on the first ↓ and desynced the selection.
+      if (s.discovered || id === activeId || s.remote) return true;
       const c = sessionContentByRoot.get(normRoot(s.root));
       return !c || !c.trivial;
     });
@@ -979,20 +1005,32 @@ function filterSessions(needle: string): number[] {
     allIds = allIds.filter((id) => projectKeyOf(orchestratorSessions.get(id)!) === want);
   }
 
-  const isDisc = (id: number): number =>
-    orchestratorSessions.get(id)!.discovered ? 1 : 0;
-
-  // Sort by (current-project-first, project, live-before-discovered,
-  // then id) so an "all" view groups the current project's sessions
-  // at the top and other projects' below, and within each project the
-  // pre-existing live sessions come first with the discovered on-disk
-  // worktrees listed after them.
-  // The dock is persistent and switches the active session constantly,
-  // so it must NOT reorder as the active project changes — pin a stable
-  // order (project, then id). The modal picker, opened fresh each time,
-  // keeps the current-project-first grouping.
+  // Sort by (current-project-first, project, then a stable identity key)
+  // so an "all" view groups the current project's sessions at the top and
+  // other projects' below.
+  //
+  // Within a project the order is a *stable* identity key, deliberately
+  // NOT the live/discovered state or the numeric id — a row must keep its
+  // place when its session changes state. Opening a discovered on-disk
+  // worktree turns it into a live session (and swaps its synthetic
+  // negative id for a positive window id), but it should stay exactly
+  // where it was instead of jumping into a "live" group and shuffling the
+  // rows under you as you arrow-navigate. The key is:
+  //   1. main checkout first — the project's own checkout (root ===
+  //      projectPath) sits above its linked worktrees. This is stable:
+  //      whether a worktree is discovered or open, its root never equals
+  //      its projectPath, so it never crosses this boundary.
+  //   2. then label, then root — alphabetical within each group.
+  //   3. id only as a final tie-break for two otherwise-identical rows.
+  //
+  // The dock is persistent and switches the active session constantly, so
+  // it must NOT reorder as the active project changes — it pins this
+  // stable order. The modal picker, opened fresh each time, additionally
+  // floats the current project to the top.
+  const isWorktree = (s: AgentSession): number =>
+    normRoot(s.root) === normRoot(projectKeyOf(s)) ? 0 : 1;
   const pinCurrentFirst = !dockMode;
-  const byProjectThenId = (a: number, b: number): number => {
+  const byProjectThenStable = (a: number, b: number): number => {
     const sa = orchestratorSessions.get(a)!;
     const sb = orchestratorSessions.get(b)!;
     const aCur = projectKeyOf(sa) === cur ? 0 : 1;
@@ -1001,14 +1039,18 @@ function filterSessions(needle: string): number[] {
     const ka = projectKeyOf(sa);
     const kb = projectKeyOf(sb);
     if (ka !== kb) return ka < kb ? -1 : 1;
-    const da = isDisc(a);
-    const db = isDisc(b);
-    if (da !== db) return da - db;
+    const wa = isWorktree(sa);
+    const wb = isWorktree(sb);
+    if (wa !== wb) return wa - wb;
+    const la = sa.label.toLowerCase();
+    const lb = sb.label.toLowerCase();
+    if (la !== lb) return la < lb ? -1 : 1;
+    if (sa.root !== sb.root) return sa.root < sb.root ? -1 : 1;
     return a - b;
   };
 
   if (!needle) {
-    const ids = allIds.slice().sort(byProjectThenId);
+    const ids = allIds.slice().sort(byProjectThenStable);
     if (scope === "current") {
       return ids.filter((id) => projectKeyOf(orchestratorSessions.get(id)!) === cur);
     }
@@ -1030,11 +1072,17 @@ function filterSessions(needle: string): number[] {
       matches.push({ id, score: 2, len: label.length });
     }
   }
-  // Live sessions before discovered worktrees at equal relevance, so
-  // the on-disk rows still trail the real sessions in search results.
+  // At equal relevance, a project's own checkout sorts before its
+  // worktrees (same stable `isWorktree` grouping as the browse list), so
+  // the on-disk / worktree rows still trail the project's own session in
+  // search results — and a result doesn't jump when a discovered worktree
+  // is opened (its root/projectPath, hence its group, don't change).
   matches.sort(
     (a, b) =>
-      a.score - b.score || isDisc(a.id) - isDisc(b.id) || a.len - b.len ||
+      a.score - b.score ||
+      isWorktree(orchestratorSessions.get(a.id)!) -
+        isWorktree(orchestratorSessions.get(b.id)!) ||
+      a.len - b.len ||
       a.id - b.id,
   );
   return matches.map((m) => m.id);
@@ -1052,7 +1100,7 @@ function dockProjectOptions(): string[] {
   const keys = new Set<string>();
   for (const [id, s] of orchestratorSessions) {
     if (!showWorktrees && s.discovered) continue;
-    if (hideTrivial && !s.discovered && id !== activeId) {
+    if (hideTrivial && !s.discovered && id !== activeId && !s.remote) {
       const c = sessionContentByRoot.get(normRoot(s.root));
       if (c && c.trivial) continue;
     }
@@ -1606,7 +1654,7 @@ function buildPreviewPane(s: AgentSession | undefined): WidgetSpec {
       styledRow([{ text: "" }]),
       styledRow([
         {
-          text: "Press Enter to open this worktree as a session.",
+          text: "Click it (or press Enter) to open this worktree as a session.",
           style: { fg: "ui.help_key_fg", italic: true },
         },
       ]),
@@ -2226,6 +2274,21 @@ function refreshOpenDialog(): void {
   }
 }
 
+// Move the dock's highlighted row onto the active window. Used when the
+// active session changes from *outside* the dock's own ↑/↓ live-switch —
+// a new session is created, or another window is focused — so the dock,
+// which is a passive mirror while blurred, highlights the session the
+// editor actually switched to instead of stranding the highlight on the
+// previously-active row. No-op when the active window isn't in the
+// (filtered) list.
+function syncDockSelectionToActive(): void {
+  if (!openDialog || !openPanel || !dockMode) return;
+  const idx = openDialog.filteredIds.indexOf(editor.activeWindow());
+  if (idx < 0) return;
+  openDialog.selectedIndex = idx;
+  openPanel.setSelectedIndex("sessions", idx);
+}
+
 // =============================================================================
 // PR probe — opportunistic `gh` integration for the pill's second line
 //
@@ -2507,6 +2570,7 @@ function openControlRoom(opts: { dock?: boolean } = {}): void {
     bulkInFlight: null,
     projectFilter: asDock ? lastDockProjectFilter : null,
     projectMenuOpen: false,
+    projectMenuIndex: 0,
   };
   // Set `dockMode` BEFORE the initial `filterSessions("")`. The sort
   // inside `filterSessions` keys off `pinCurrentFirst = !dockMode`: the
@@ -2692,37 +2756,122 @@ function dockTitleRow(): WidgetSpec {
   };
 }
 
+// Option keys for the dock's project dropdown, in display order. Index 0
+// is always "All projects" (the empty-string key); the rest are the
+// projects with a session in the worktree/trivial-filtered set. The
+// project menu's keyboard cursor (`projectMenuIndex`) and the
+// `dock_menu_*` nav handlers index into this list, so it's the single
+// source of truth for both render and navigation.
+function projectMenuKeys(): string[] {
+  return ["", ...dockProjectOptions()];
+}
+
+// The `project-pick:<key>` widget key for a menu row — the host reads
+// this focus key to recognise that the dropdown (not the session list)
+// owns the keyboard, and to route ↑/↓/Enter/Esc to the `dock_menu_*`
+// events. Empty suffix = "All projects".
+function projectPickKey(optionKey: string): string {
+  return `project-pick:${optionKey}`;
+}
+
 // Floating menu for the dock's project dropdown: "All projects" plus
 // every project with a session in the worktree/trivial-filtered set.
 // Anchored just under the toolbar via `overlay`, so it paints over the
 // rows below without reflowing them. Each option is a button whose key
 // (`project-pick:<key>`, empty suffix = all) the widget_event handler
-// decodes.
+// decodes. The `●` marks the *applied* filter; the `primary` intent
+// marks the keyboard *cursor* (`projectMenuIndex`) — two separate
+// signals so ↑/↓ can move the cursor over options without yet applying
+// them, the way a standard dropdown behaves.
 function dockProjectMenu(): WidgetSpec {
   const cur = openDialog?.projectFilter ?? null;
-  const opts = dockProjectOptions();
-  const rows: WidgetSpec[] = [
-    row(
-      button(cur === null ? "● All projects" : "  All projects", {
-        key: "project-pick:",
-        intent: cur === null ? "primary" : "normal",
+  const keys = projectMenuKeys();
+  const cursor = clampMenuIndex(openDialog?.projectMenuIndex ?? 0, keys.length);
+  const rows: WidgetSpec[] = keys.map((key, i) => {
+    const applied = key === "" ? cur === null : key === cur;
+    const label = key === "" ? "All projects" : projectLabel(key);
+    return row(
+      button((applied ? "● " : "  ") + label, {
+        key: projectPickKey(key),
+        intent: i === cursor ? "primary" : "normal",
       }),
       flexSpacer(),
-    ),
-  ];
-  for (const key of opts) {
-    const sel = key === cur;
-    rows.push(
-      row(
-        button((sel ? "● " : "  ") + projectLabel(key), {
-          key: `project-pick:${key}`,
-          intent: sel ? "primary" : "normal",
-        }),
-        flexSpacer(),
-      ),
     );
-  }
+  });
   return overlay(labeledSection({ label: "project", child: col(...rows) }));
+}
+
+// Clamp a menu cursor into `[0, len)`, tolerating an empty list.
+function clampMenuIndex(idx: number, len: number): number {
+  if (len <= 0) return 0;
+  return Math.max(0, Math.min(idx, len - 1));
+}
+
+// Open the dock's project dropdown and hand it the keyboard. Seeds the
+// cursor on the *applied* option (so ↑/↓ start from where you are) and
+// moves panel focus onto that option's button — which is the signal the
+// host uses to route nav keys here instead of the session list.
+function openProjectMenu(): void {
+  if (!openDialog || !openPanel) return;
+  const keys = projectMenuKeys();
+  const applied = openDialog.projectFilter;
+  const idx = applied === null ? 0 : Math.max(0, keys.indexOf(applied));
+  openDialog.projectMenuOpen = true;
+  openDialog.projectMenuIndex = clampMenuIndex(idx, keys.length);
+  // Render the menu first so its buttons exist in the spec, *then* move
+  // focus onto the cursor row — otherwise the host re-clamps an unknown
+  // focus key back to the first tabbable.
+  openPanel.update(buildDockSpec());
+  openPanel.setFocusKey(projectPickKey(keys[openDialog.projectMenuIndex]));
+}
+
+// Close the dropdown and return the keyboard to the session list.
+function closeProjectMenu(): void {
+  if (!openDialog || !openPanel) return;
+  openDialog.projectMenuOpen = false;
+  openPanel.update(buildDockSpec());
+  openPanel.setFocusKey("sessions");
+}
+
+// Move the dropdown cursor by `delta` (clamped, no wrap) and keep panel
+// focus on the highlighted row so the host keeps routing nav keys here.
+function moveProjectMenu(delta: number): void {
+  if (!openDialog || !openPanel || !openDialog.projectMenuOpen) return;
+  const keys = projectMenuKeys();
+  const next = clampMenuIndex(openDialog.projectMenuIndex + delta, keys.length);
+  openDialog.projectMenuIndex = next;
+  openPanel.update(buildDockSpec());
+  openPanel.setFocusKey(projectPickKey(keys[next]));
+}
+
+// Commit the cursor's option as the active project filter and close.
+function acceptProjectMenu(): void {
+  if (!openDialog || !openDialog.projectMenuOpen) return;
+  const keys = projectMenuKeys();
+  const key = keys[clampMenuIndex(openDialog.projectMenuIndex, keys.length)] ?? "";
+  pickProject(key);
+}
+
+// Apply a project-dropdown option (empty = "All projects") as the dock's
+// project filter, re-filter the session list, close the menu, and return
+// focus to the list. Shared by mouse clicks on a row, Enter on the
+// keyboard cursor, and any programmatic pick.
+function pickProject(optionKey: string): void {
+  if (!openDialog) return;
+  openDialog.projectFilter = optionKey === "" ? null : optionKey;
+  lastDockProjectFilter = openDialog.projectFilter;
+  // Re-filter to the chosen project and keep the active session selected
+  // when it's still in view.
+  const activeId = editor.activeWindow();
+  const next = filterSessions(openDialog.filter.value);
+  openDialog.filteredIds = next;
+  const activeIdx = next.indexOf(activeId);
+  openDialog.selectedIndex = activeIdx >= 0 ? activeIdx : 0;
+  closeProjectMenu();
+  refreshOpenDialog();
+  if (openPanel && next.length > 0) {
+    openPanel.setSelectedIndex("sessions", openDialog.selectedIndex);
+  }
 }
 
 // Single-column spec for the dock. Reuses the same `sessions` list key +
@@ -2759,13 +2908,24 @@ function buildDockSpec(): WidgetSpec {
   // (req: hide them when the editor owns the keyboard). A blurred dock
   // gives the row back to the list.
   const showHints = !dockBlurred;
+  // While the project dropdown owns the keyboard, the hints describe the
+  // dropdown (choose/select/cancel), not the session list — otherwise
+  // they'd advertise the wrong keys for where focus actually is.
   const hintRow = row(
     flexSpacer(),
-    hintBar([
-      { keys: "↑↓", label: "switch" },
-      { keys: "Enter", label: "edit" },
-      { keys: "Esc", label: "editor" },
-    ]),
+    hintBar(
+      openDialog.projectMenuOpen
+        ? [
+          { keys: "↑↓", label: "choose" },
+          { keys: "Enter", label: "select" },
+          { keys: "Esc", label: "cancel" },
+        ]
+        : [
+          { keys: "↑↓", label: "switch" },
+          { keys: "Enter", label: "edit" },
+          { keys: "Esc", label: "editor" },
+        ],
+    ),
     flexSpacer(),
   );
   const bottom: WidgetSpec[] = showHints ? [hintRow] : [];
@@ -2831,38 +2991,184 @@ function buildDockSpec(): WidgetSpec {
   );
 }
 
+// ---------------------------------------------------------------------
+// Dock session context menu (right-click).
+//
+// A centered, dimmed floating modal (its own host slot, so the dock
+// stays visible behind it) offering Visit / Archive / Delete against a
+// single right-clicked session. The destructive actions (Archive,
+// Delete) swap the same panel to a confirmation pane — reusing the
+// modal picker's `buildConfirmPane` — before they run. Visit acts
+// immediately.
+// ---------------------------------------------------------------------
+
+// Visit the session behind the context menu: switch the active window to
+// it and hand keyboard focus to the editor (the dock stays visible). A
+// discovered on-disk worktree has no live window, so attach a fresh
+// session to it instead — mirrors the dock's Enter (`dock_activate`).
+function dockMenuVisit(id: number): void {
+  const s = orchestratorSessions.get(id);
+  if (!s) return;
+  if (s.discovered) {
+    // Visit "dives in" (like the live path below, which blurs to the
+    // editor), so attach with dive: true.
+    void attachToWorktree({
+      root: s.root,
+      projectPath: s.projectPath ?? s.root,
+      label: s.label,
+      branch: s.branch,
+      discoveredId: s.id,
+      dive: true,
+    });
+    return;
+  }
+  if (id > 0 && id !== editor.activeWindow()) editor.setActiveWindow(id);
+  if (openPanel && dockMode) {
+    dockBlurred = true;
+    editor.floatingPanelControl(openPanel.id(), "blur", 0);
+    editor.setEditorMode(null);
+  }
+}
+
+function buildDockMenuSpec(state: DockMenuState): WidgetSpec {
+  if (state.stage === "confirm") {
+    // Reuse the picker's confirmation pane (single-session form). Its
+    // buttons are keyed `confirm-cancel` / `confirm-<action>`, handled
+    // in the dock-menu `widget_event` block.
+    return buildConfirmPane({ action: state.action, ids: [state.sessionId] });
+  }
+  const s = orchestratorSessions.get(state.sessionId);
+  const label = s?.label ?? `[${state.sessionId}]`;
+  const canArchive = bulkEligible("archive", state.sessionId);
+  const canDelete = bulkEligible("delete", state.sessionId);
+  // Intentionally intrinsic-width content only: NO `labeledSection`,
+  // `flexSpacer`, or `fullWidth` widgets — those expand to the panel
+  // width and would blow the anchored popup up to ~half the screen. The
+  // host frames the box (its border) and sizes it to the widest of these
+  // rows, so the popup hugs its items like a real context menu.
+  return col(
+    { kind: "raw", entries: [
+      styledRow([{ text: `${label}`, style: { bold: true } }]),
+    ] },
+    button("Visit…", { intent: "primary", key: "ctx-visit" }),
+    button("Archive", { key: "ctx-archive", disabled: !canArchive }),
+    button("Delete", { intent: "danger", key: "ctx-delete", disabled: !canDelete }),
+    { kind: "raw", entries: [
+      styledRow([{ text: "Esc to close", style: { fg: "ui.menu_disabled_fg" } }]),
+    ] },
+  );
+}
+
+function renderDockMenu(): void {
+  if (dockMenuPanel && dockMenuState) {
+    dockMenuPanel.update(buildDockMenuSpec(dockMenuState));
+  }
+}
+
+// Pack a screen cell into the single numeric arg `floatingPanelControl`
+// takes (the host unpacks `y << 16 | x`). Both coords fit a u16.
+function packCell(col: number, row: number): number {
+  return (Math.max(0, row) * 65536) + Math.max(0, col);
+}
+
+// Anchor the menu popup at its stored right-click cell — an unobtrusive,
+// content-sized popup with no background dim.
+function anchorDockMenu(): void {
+  if (!dockMenuPanel || !dockMenuState) return;
+  editor.floatingPanelControl(
+    dockMenuPanel.id(),
+    "anchor",
+    packCell(dockMenuState.anchorCol, dockMenuState.anchorRow),
+  );
+}
+
+// Open the right-click context menu for the session at filtered-list
+// `index`, anchored at the click cell `(col, row)`. The dock stays
+// mounted in its own slot behind the popup.
+function openDockContextMenu(index: number, col: number, row: number): void {
+  if (!openDialog) return;
+  const id = openDialog.filteredIds[index];
+  if (typeof id !== "number") return;
+  // Align the dock's highlighted row with the right-clicked one so the
+  // menu and the list agree on the target.
+  openDialog.selectedIndex = index;
+  if (openPanel) openPanel.setSelectedIndex("sessions", index);
+  dockMenuState = { sessionId: id, anchorCol: col, anchorRow: row, stage: "menu" };
+  if (!dockMenuPanel) dockMenuPanel = new FloatingWidgetPanel();
+  // widthPct/heightPct seed the centered confirm stage; the anchored menu
+  // stage ignores them (it sizes to content). Mount, then anchor.
+  dockMenuPanel.mount(buildDockMenuSpec(dockMenuState), {
+    widthPct: 50,
+    heightPct: 44,
+  });
+  anchorDockMenu();
+}
+
+// Switch the popup to the centered, full-screen-dimmed confirmation for a
+// destructive action. Reuses the same panel; only the placement + spec
+// change.
+function dockMenuEnterConfirm(action: "archive" | "delete"): void {
+  if (!dockMenuPanel || !dockMenuState) return;
+  dockMenuState = { ...dockMenuState, stage: "confirm", action };
+  editor.floatingPanelControl(dockMenuPanel.id(), "center", 0);
+  editor.floatingPanelControl(dockMenuPanel.id(), "fullscreen", 1);
+  renderDockMenu();
+}
+
+function closeDockContextMenu(): void {
+  if (dockMenuPanel) {
+    dockMenuPanel.unmount();
+    dockMenuPanel = null;
+  }
+  dockMenuState = null;
+}
+
+// Tear down the menu and hand keyboard focus back to the dock (whose
+// keys were blurred when the popup mounted). Mirrors `restoreDockAfterForm`.
+function closeDockContextMenuAndRestoreDock(): void {
+  closeDockContextMenu();
+  if (openPanel && dockMode) {
+    dockBlurred = false;
+    dockFocus = "list";
+    editor.floatingPanelControl(openPanel.id(), "focus", 0);
+    openPanel.setFocusKey("sessions");
+    refreshOpenDialog();
+  }
+}
+
 // Commit the highlighted session as the active window after a short
 // debounce, so holding ↑/↓ to traverse the list doesn't thrash through
 // every session in between. `fromEdge` drives the directional wipe.
 function scheduleDockSwitch(fromEdge: "top" | "bottom" | null): void {
   const token = ++dockSwitchToken;
-  console.warn(`[dock-switch] scheduled token=${token} fromEdge=${fromEdge}`);
   void (async () => {
     await editor.delay(30);
-    if (token !== dockSwitchToken) {
-      console.warn(`[dock-switch] token=${token} superseded by ${dockSwitchToken}`);
-      return;
-    }
-    if (!openDialog || !openPanel || !dockMode || dockBlurred) {
-      console.warn(
-        `[dock-switch] token=${token} skipped: openDialog=${!!openDialog} openPanel=${!!openPanel} dockMode=${dockMode} dockBlurred=${dockBlurred}`,
-      );
-      return;
-    }
+    // Superseded by a later keystroke — let the latest one win.
+    if (token !== dockSwitchToken) return;
+    if (!openDialog || !openPanel || !dockMode || dockBlurred) return;
     const id = openDialog.filteredIds[openDialog.selectedIndex];
-    if (typeof id !== "number" || id <= 0) {
-      console.warn(`[dock-switch] token=${token} no valid id: ${id}`);
+    if (typeof id !== "number") return;
+    const sess = orchestratorSessions.get(id);
+    // A discovered (on-disk) worktree has no window to switch to — in the
+    // dock's live-switch model the highlighted row *is* the active
+    // session, so opening it means attaching a fresh session at the
+    // worktree. Do that without diving (keep the dock focused) so it
+    // matches switching to a live row, and you can keep arrowing. The
+    // 30 ms debounce above means scrolling *past* it without pausing
+    // never spawns a session.
+    if (sess?.discovered) {
+      void attachToWorktree({
+        root: sess.root,
+        projectPath: sess.projectPath ?? sess.root,
+        label: sess.label,
+        branch: sess.branch,
+        discoveredId: sess.id,
+        dive: false,
+      });
       return;
     }
-    if (orchestratorSessions.get(id)?.discovered) {
-      console.warn(`[dock-switch] token=${token} id=${id} is discovered, skipping`);
-      return;
-    }
-    if (id === editor.activeWindow()) {
-      console.warn(`[dock-switch] token=${token} id=${id} already active`);
-      return;
-    }
-    console.warn(`[dock-switch] token=${token} firing setActiveWindow(${id}) fromEdge=${fromEdge}`);
+    if (id <= 0) return;
+    if (id === editor.activeWindow()) return;
     if (fromEdge) editor.setActiveWindowAnimated(id, fromEdge);
     else editor.setActiveWindow(id);
   })();
@@ -3772,13 +4078,20 @@ function rebuildFormFocusCycle(): void {
   } else if (form.backend === "devcontainer") {
     cycle.push("project_path", "name", "cmd");
   } else if (form.backend === "ssh") {
-    cycle.push("ssh_host", "ssh_path", "ssh_identity", "name", "cmd");
+    cycle.push("ssh_host", "ssh_path", "ssh_identity", "ssh_options", "name", "cmd");
   } else if (form.backend === "kubernetes") {
     cycle.push("k8s_target");
     if (form.k8sTarget.value.trim().length === 0) {
       cycle.push("k8s_context", "k8s_namespace", "k8s_pod", "k8s_workspace");
     }
     cycle.push("name", "cmd");
+  }
+  // Make the agent presets keyboard-reachable: drop them just before the
+  // Agent Command field so Tab lands on the dropdown before the free-text
+  // input (mirrors how the "Run in:" tabs precede their fields).
+  const cmdIdx = cycle.indexOf("cmd");
+  if (cmdIdx >= 0) {
+    cycle.splice(cmdIdx, 0, ...agentPresets().map((p) => p.key));
   }
   cycle.push("cancel", "create");
   formFocusCycle = cycle;
@@ -3935,6 +4248,183 @@ function splitAgentCmd(s: string): string[] {
   }
   if (cur.length > 0) out.push(cur);
   return out;
+}
+
+// =============================================================================
+// Agent resume registry
+//
+// How known coding agents rejoin a prior conversation after an editor restart.
+// This is *policy/data*: the host core knows none of it — it just persists the
+// resolved `resume` argv and runs it on restore (see the `resume` option on
+// `createWindowWithTerminal` and `terminal.resume_agents`). Two strategies,
+// preferring the first when an agent supports it:
+//
+//   provision — mint a session id at launch (`<agent> … --session-id <uuid>`)
+//               and resume with it (`<agent> --resume <uuid>`). Precise: the id
+//               is ours from birth, so there's nothing to capture and no need
+//               to read the agent's private state. The uuid is a plain argv
+//               element, never interpolated into a shell string.
+//   continue  — resume the most recent session in the cwd (`<agent> --continue`),
+//               no id. Relies on the orchestrator's one-agent-per-worktree
+//               model, where "latest in this cwd" is unambiguous.
+//
+// Matched by argv0 basename. Flags are each agent's documented resume
+// interface; entries are easy to add and intended to become user-overridable.
+// `{id}` in a template is replaced with the minted uuid (array slot only).
+interface AgentResumeSpec {
+  provision?: { idFlag: string; resumeArgs: string[] };
+  continue?: { resumeArgs: string[] };
+}
+// `id` is the command the New Session dropdown fills in and the basename the
+// matcher keys on; `match` lets a path/args form (e.g. `/usr/bin/claude --foo`)
+// still resolve to the entry.
+const AGENT_REGISTRY: Array<{ id: string; match: RegExp; spec: AgentResumeSpec }> = [
+  {
+    // Claude Code CLI: `--session-id <uuid>` pins the session at launch;
+    // `--resume <uuid>` rejoins it; `--continue` resumes the latest in cwd.
+    id: "claude",
+    match: /^claude$/,
+    spec: {
+      provision: { idFlag: "--session-id", resumeArgs: ["--resume", "{id}"] },
+      continue: { resumeArgs: ["--continue"] },
+    },
+  },
+  {
+    // aider keeps its conversation in the repo and reloads it with
+    // `--restore-chat-history`; it has no caller-supplied session id, so it's
+    // a continue-only (strategy B) agent.
+    id: "aider",
+    match: /^aider$/,
+    spec: { continue: { resumeArgs: ["--restore-chat-history"] } },
+  },
+];
+
+// Presets for the New Session "Agent Command" dropdown: the plain shell
+// (default), every registry agent (which a restart will resume), and a
+// "custom…" entry that just hands focus to the free-text field so the user can
+// type any command. Built from the registry so adding an agent surfaces it in
+// the UI automatically. `custom` presets leave the command untouched.
+interface AgentPreset {
+  label: string;
+  cmd: string;
+  key: string;
+  resumes: boolean;
+  custom?: boolean;
+}
+function agentPresets(): AgentPreset[] {
+  const presets: AgentPreset[] = [
+    { label: "terminal", cmd: "", key: "agent-preset-terminal", resumes: false },
+  ];
+  for (const e of AGENT_REGISTRY) {
+    presets.push({
+      label: e.id,
+      cmd: e.id,
+      key: `agent-preset-${e.id}`,
+      resumes: true,
+    });
+  }
+  presets.push({
+    label: "custom…",
+    cmd: "",
+    key: "agent-preset-custom",
+    resumes: false,
+    custom: true,
+  });
+  return presets;
+}
+
+// Which preset the current command text corresponds to: an exact match on a
+// known agent / the empty shell, else "custom…" (covers a typed command or an
+// agent with extra args). Drives the dropdown's active highlight.
+function activeAgentPresetKey(): string {
+  const current = form ? form.cmd.value.trim() : "";
+  const match = agentPresets().find((p) => !p.custom && p.cmd === current);
+  return match ? match.key : "agent-preset-custom";
+}
+
+// Apply a dropdown choice: a normal preset fills the command field; the
+// "custom…" entry just moves focus to that field so the user can type, leaving
+// any existing text in place.
+function applyAgentPreset(p: AgentPreset): void {
+  if (!form) return;
+  if (p.custom) {
+    // Hand focus to the free-text field so the user can type a command.
+    // Focus must be set *after* the re-render — re-mounting the spec resets
+    // host focus, which would otherwise clobber the setFocusKey.
+    renderForm();
+    formPanel?.setFocusKey("cmd");
+    snapFormFocusTo("cmd");
+    return;
+  }
+  form.cmd.value = p.cmd;
+  form.cmd.cursor = p.cmd.length;
+  // The Text widget's content is host-authoritative; push the new value into
+  // it (re-rendering the spec alone won't change an already-mounted input).
+  formPanel?.setValue("cmd", form.cmd.value, form.cmd.cursor);
+  renderForm();
+}
+
+// ←/→ over the agent dropdown (mirrors the "Run in:" tabs' switchTabIfFocused):
+// when focus sits on a preset button, arrows move the selection and apply it.
+// Returns true if it consumed the key.
+function switchAgentIfFocused(delta: 1 | -1): boolean {
+  if (!form) return false;
+  const presets = agentPresets();
+  const idx = presets.findIndex((p) => p.key === formFocusedKey());
+  if (idx < 0) return false;
+  const next = (idx + delta + presets.length) % presets.length;
+  const target = presets[next];
+  applyAgentPreset(target);
+  // Keep focus on the row (unless the choice moved it to the text field).
+  if (!target.custom) {
+    formPanel?.setFocusKey(target.key);
+    snapFormFocusTo(target.key);
+  }
+  return true;
+}
+
+// A v4-style unique id for an agent session handle. Not security-sensitive
+// (it just names a conversation), so `Math.random` is fine — we never need
+// unpredictability, only uniqueness within a user's session store.
+function agentSessionUuid(): string {
+  const hex = "0123456789abcdef";
+  let s = "";
+  for (let i = 0; i < 32; i++) {
+    if (i === 8 || i === 12 || i === 16 || i === 20) s += "-";
+    if (i === 12) {
+      s += "4"; // version
+    } else if (i === 16) {
+      s += hex[8 + Math.floor(Math.random() * 4)]; // variant 8–b
+    } else {
+      s += hex[Math.floor(Math.random() * 16)];
+    }
+  }
+  return s;
+}
+
+// Resolve a user's agent argv into the argv to *launch* and the argv to run on
+// *restore* (resume), per the registry. Unknown commands (plain shells, custom
+// agents) pass through unchanged with no resume — i.e. today's behaviour.
+function resolveAgentLaunch(
+  argv: string[],
+): { launch: string[]; resume?: string[] } {
+  if (argv.length === 0) return { launch: argv };
+  const argv0 = argv[0];
+  const base = editor.pathBasename(argv0) || argv0;
+  const entry = AGENT_REGISTRY.find((e) => e.match.test(base));
+  if (!entry) return { launch: argv };
+  if (entry.spec.provision) {
+    const id = agentSessionUuid();
+    const { idFlag, resumeArgs } = entry.spec.provision;
+    return {
+      launch: [...argv, idFlag, id],
+      resume: [argv0, ...resumeArgs.map((a) => a.replace("{id}", id))],
+    };
+  }
+  if (entry.spec.continue) {
+    return { launch: argv, resume: [argv0, ...entry.spec.continue.resumeArgs] };
+  }
+  return { launch: argv };
 }
 
 async function spawnCollect(
@@ -4294,6 +4784,35 @@ function backendTabsRow(): WidgetSpec {
   return row(...parts);
 }
 
+// "Agent:" preset row above the Agent Command field. One button per known
+// agent (plus the default plain `terminal`); picking one fills the command.
+// Agents that resume across restarts are tagged with `↻`, and the row spells
+// that out — so a user discovers both that `claude` is an option and that it
+// gets special session handling. The resume tag only shows for the local
+// backend, the one where resume is wired today.
+function agentPresetRow(): WidgetSpec {
+  const showsResume = !form || form.backend === "local";
+  const activeKey = activeAgentPresetKey();
+  const parts: WidgetSpec[] = [
+    {
+      kind: "raw",
+      entries: [styledRow([{ text: "Agent:", style: { fg: "ui.menu_disabled_fg" } }])],
+    },
+  ];
+  for (const p of agentPresets()) {
+    parts.push(spacer(1));
+    const label = p.resumes && showsResume ? `${p.label} ↻` : p.label;
+    parts.push(button(label, { key: p.key, intent: p.key === activeKey ? "primary" : undefined }));
+  }
+  parts.push(flexSpacer());
+  const hint = showsResume ? "←/→ choose · ↻ resumes on restart" : "←/→ choose";
+  parts.push({
+    kind: "raw",
+    entries: [styledRow([{ text: hint, style: { fg: "ui.menu_disabled_fg", italic: true } }])],
+  });
+  return row(...parts);
+}
+
 // Local backend: Project Path + worktree toggle + linked-worktree hint.
 function localBodyFields(): WidgetSpec[] {
   if (!form) return [];
@@ -4409,16 +4928,17 @@ function devcontainerBodyFields(): WidgetSpec[] {
   ];
 }
 
-// SSH backend: host (`user@host[:port]`), remote path, optional identity file.
+// SSH backend: host (`[user@]host[:port]`), remote path, optional identity
+// file, and free-form extra ssh arguments.
 function sshBodyFields(): WidgetSpec[] {
   if (!form) return [];
   return [
     labeledSection({
-      label: "Host  (user@host[:port])",
+      label: "Host  ([user@]host[:port])",
       child: text({
         value: form.sshHost.value,
         cursorByte: form.sshHost.cursor,
-        placeholder: "deploy@build-01  ·  or paste ssh://host/path",
+        placeholder: "build-01  ·  deploy@build-01:22  ·  or paste ssh://host/path",
         fullWidth: true,
         key: "ssh_host",
       }),
@@ -4441,6 +4961,16 @@ function sshBodyFields(): WidgetSpec[] {
         placeholder: "~/.ssh/id_ed25519",
         fullWidth: true,
         key: "ssh_identity",
+      }),
+    }),
+    labeledSection({
+      label: "SSH options (optional)",
+      child: text({
+        value: form.sshOptions.value,
+        cursorByte: form.sshOptions.cursor,
+        placeholder: "-J jump-host  ·  -o ProxyCommand=…  (passed to every ssh call)",
+        fullWidth: true,
+        key: "ssh_options",
       }),
     }),
   ];
@@ -4535,8 +5065,87 @@ function backendBodyFields(): WidgetSpec[] {
   }
 }
 
+// While a submit is in flight the dialog is *disabled*: the editable fields and
+// the backend tabs are replaced with a read-only summary and only Cancel stays
+// actionable (Create is shown disabled). It holds until the attach resolves —
+// success closes the dialog, failure flips `submitting` back off and re-renders
+// the editable form with the error. Applies to every backend (a fresh `openForm`
+// always starts with `submitting = false`, so the next open is reset).
+function buildConnectingView(): WidgetSpec {
+  if (!form) return col();
+  const roRow = (label: string, value: string): WidgetSpec => ({
+    kind: "raw",
+    entries: [
+      styledRow([
+        { text: `${label}: `, style: { fg: "ui.menu_disabled_fg", bold: true } },
+        { text: value || "—", style: { fg: "ui.menu_disabled_fg" } },
+      ]),
+    ],
+  });
+  const rows: WidgetSpec[] = [];
+  if (form.backend === "ssh") {
+    rows.push(roRow("Run in", "SSH"));
+    rows.push(roRow("Host", form.sshHost.value.trim()));
+    if (form.sshPath.value.trim()) rows.push(roRow("Remote path", form.sshPath.value.trim()));
+  } else if (form.backend === "kubernetes") {
+    rows.push(roRow("Run in", "Kubernetes"));
+    const ns = form.k8sNamespace.value.trim();
+    const pod = form.k8sPod.value.trim();
+    rows.push(roRow("Pod", form.k8sTarget.value.trim() || `${ns}/${pod}`));
+  } else {
+    rows.push(roRow("Run in", form.backend === "devcontainer" ? "Devcontainer" : "Local"));
+    rows.push(roRow("Project", form.projectPath.value.trim() || form.defaultProjectPath));
+  }
+  const name = form.name.value.trim();
+  if (name) rows.push(roRow("Session", name));
+
+  const remote = form.backend === "ssh" || form.backend === "kubernetes";
+  return col(
+    row(
+      flexSpacer(),
+      {
+        kind: "raw",
+        entries: [
+          styledRow([
+            { text: "ORCHESTRATOR", style: HEADER_KEYWORD_STYLE },
+            { text: " :: ", style: HEADER_SEP_STYLE },
+            { text: "New Session", style: HEADER_LABEL_STYLE },
+          ]),
+        ],
+      },
+      flexSpacer(),
+    ),
+    spacer(0),
+    ...rows,
+    spacer(0),
+    {
+      kind: "raw",
+      entries: [
+        styledRow([
+          {
+            text: remote ? "Connecting… " : "Creating session… ",
+            style: { fg: "ui.menu_disabled_fg", bold: true, italic: true },
+          },
+          {
+            text: "press Cancel to abort.",
+            style: { fg: "ui.menu_disabled_fg", italic: true },
+          },
+        ]),
+      ],
+    },
+    spacer(0),
+    wrappingRow(
+      button("Cancel", { intent: "danger", key: "cancel" }),
+      spacer(2),
+      button("Create Session", { intent: "primary", key: "create", disabled: true }),
+    ),
+  );
+}
+
 function buildFormSpec(): WidgetSpec {
   if (!form) return col();
+  // Disabled/connecting state: read-only summary + Cancel-only (item 3).
+  if (form.submitting) return buildConnectingView();
 
   const children: WidgetSpec[] = [
     // === Header: centered title (no stale `Review Synthesized`). =
@@ -4578,19 +5187,18 @@ function buildFormSpec(): WidgetSpec {
         key: "name",
       }),
     }),
+    agentPresetRow(),
     labeledSection({
       label: "Agent Command",
       child: text({
         value: form.cmd.value,
         cursorByte: form.cmd.cursor,
-        // Empty submission spawns a bare terminal — the host
-        // picks the shell with the same logic it uses for any
-        // other embedded terminal, so the plugin doesn't have
-        // to second-guess `$SHELL` resolution. If the user
-        // submitted a non-empty cmd in the previous run we
-        // surface it here as a hint (placeholder only — see
-        // `NewSessionForm.lastCmd`).
-        placeholder: form.lastCmd || "terminal",
+        // Clearing the field falls back to the backend default: a bare local
+        // terminal (the host resolves `$SHELL`), or — for SSH — letting ssh
+        // spawn the remote login shell. The placeholder names that default.
+        placeholder: form.backend === "ssh"
+          ? "remote login shell  (clear to reset)"
+          : "terminal",
         fullWidth: true,
         key: "cmd",
       }),
@@ -4600,6 +5208,10 @@ function buildFormSpec(): WidgetSpec {
   if (form.backend === "local") {
     children.push(localBranchSection());
   }
+  // Remote backends connect asynchronously and the dialog stays open until the
+  // session is real (see `runRemoteAttach`). The in-flight "connecting" state
+  // is rendered by `buildConnectingView` (the early return above), so nothing
+  // is needed here for it.
   if (form.lastError) {
     children.push(spacer(0));
     children.push({
@@ -4677,6 +5289,7 @@ function openForm(options?: { fromPicker?: boolean }): void {
     sshHost: { value: "", cursor: 0 },
     sshPath: { value: "", cursor: 0 },
     sshIdentity: { value: "", cursor: 0 },
+    sshOptions: { value: "", cursor: 0 },
     k8sTarget: { value: "", cursor: 0 },
     k8sContext: { value: "", cursor: 0 },
     k8sNamespace: { value: "", cursor: 0 },
@@ -4684,12 +5297,12 @@ function openForm(options?: { fromPicker?: boolean }): void {
     k8sWorkspace: { value: "", cursor: 0 },
     projectPath: { value: "", cursor: 0 },
     name: { value: "", cursor: 0 },
-    // Empty value — `lastCmd` shows as the placeholder. If the
-    // user submits an empty cmd, the placeholder is used as the
-    // actual command (see `submitForm`). This makes the
-    // placeholder a genuine "press Enter to re-use this" hint
-    // rather than a visual lie.
-    cmd: { value: "", cursor: 0 },
+    // Prefill the last-used command as *actual* editable text (not a
+    // placeholder), so the field value is the single source of truth: keep it,
+    // edit it, or clear it to fall back to the backend default (a bare local
+    // terminal, or — for SSH — the remote login shell). No hidden
+    // "empty means reuse lastCmd" fallback at submit time.
+    cmd: { value: lastCmd, cursor: lastCmd.length },
     branch: { value: "", cursor: 0 },
     // Default checkbox state is `true` (the historical behaviour
     // of "always create a worktree"); the renderer demotes this
@@ -4704,7 +5317,6 @@ function openForm(options?: { fromPicker?: boolean }): void {
     defaultSessionName: "",
     defaultBranch: "",
     defaultBranchIsHeadFallback: false,
-    lastCmd,
     fromPicker: !!options?.fromPicker,
     probeToken: 0,
     historyCursor: { project_path: -1, name: -1, cmd: -1, branch: -1 },
@@ -5109,6 +5721,14 @@ function restoreDockAfterForm(): boolean {
 // just hand focus back to it instead.
 function cancelForm(): void {
   const wasFromPicker = !!form?.fromPicker;
+  // Cancelling while a remote connect is in flight: tell the host to abort it.
+  // The pending `attachRemoteAgent` promise rejects with "cancelled" (its catch
+  // is a no-op once `form` is null below) and the connect's late result is
+  // discarded host-side, so no window is ever built.
+  if (form?.submitting) {
+    pendingRemoteFacet = null;
+    editor.cancelRemoteAgent();
+  }
   closeForm();
   if (restoreDockAfterForm()) return;
   if (wasFromPicker) {
@@ -5125,6 +5745,49 @@ function cancelForm(): void {
 // Warm per-window remote sessions that sit *beside* local ones (rather than
 // retargeting the whole editor) are the follow-up — see Gap B in
 // docs/internal/NEW_SESSION_DIALOG_WIREFRAMES.md.
+// Submit a remote (SSH / Kubernetes) attach and keep the New-Session dialog
+// open until the session is actually real. `attachRemoteAgent` now resolves
+// only once the editor has built the authority AND the born-attached window,
+// and rejects (with the reason — e.g. ssh "Could not resolve hostname") if the
+// connect or window creation fails, creating no window. So we drive the dialog
+// off that promise: show the failure inline and stay open to retry, instead of
+// closing optimistically and leaving the user with a half-built/empty window.
+async function runRemoteAttach(
+  spec: RemoteAgentSpec,
+  facet: AgentSession["remote"],
+): Promise<void> {
+  if (!form) return;
+  form.submitting = true;
+  form.lastError = null;
+  // The `window_created` hook (fired mid-attach on success) tags the new
+  // session row with this facet; cleared on failure since no window appears.
+  pendingRemoteFacet = facet;
+  renderForm();
+  // The disabled/connecting view exposes only Cancel — land focus there so
+  // Enter/Esc act on it.
+  formPanel?.setFocusKey("cancel");
+  try {
+    await editor.attachRemoteAgent(spec);
+    // Authority + window are live and the hook has adopted the facet — only
+    // now is it safe to dismiss the dialog. (Guard against the user having
+    // cancelled / reopened the form while the connect was in flight.)
+    if (form && form.submitting) closeForm();
+  } catch (e) {
+    pendingRemoteFacet = null;
+    if (!form) return;
+    form.submitting = false;
+    form.lastError = remoteAttachErrorText(e);
+    renderForm();
+  }
+}
+
+// `attachRemoteAgent` rejects with an Error whose message is the host's
+// reason (ssh diagnostic, a window-creation failure, a bad spec, …).
+function remoteAttachErrorText(e: unknown): string {
+  const msg = e instanceof Error ? e.message : String(e ?? "");
+  return msg.trim() || "connection failed";
+}
+
 async function submitRemoteForm(backend: SessionBackend): Promise<void> {
   if (!form) return;
   const fail = (msg: string): void => {
@@ -5135,7 +5798,9 @@ async function submitRemoteForm(backend: SessionBackend): Promise<void> {
     renderForm();
   };
   const sessionName = form.name.value.trim();
-  const cmd = form.cmd.value.trim() || form.lastCmd.trim();
+  // The field value is authoritative: empty means "use the backend default"
+  // (a bare remote/login shell), not "silently reuse the last command".
+  const cmd = form.cmd.value.trim();
 
   if (backend === "kubernetes") {
     const target = form.k8sTarget.value.trim();
@@ -5169,65 +5834,62 @@ async function submitRemoteForm(backend: SessionBackend): Promise<void> {
       label: sessionName || `k8s:${namespace}/${pod}`,
       command: agentArgv.length > 0 ? agentArgv : undefined,
     };
-    closeForm();
-    editor.setStatus(`Orchestrator: attaching pod ${namespace}/${pod}…`);
-    // Remember the pending facet so the `window_created` hook can tag the new
-    // session row as a Kubernetes workspace.
-    pendingRemoteFacet = { kind: "kubernetes", detail: `${namespace}/${pod}`, state: "running" };
-    editor.attachRemoteAgent(spec);
+    await runRemoteAttach(spec, {
+      kind: "kubernetes",
+      detail: `${namespace}/${pod}`,
+      state: "running",
+    });
     return;
   }
 
   if (backend === "ssh") {
-    // Parse `user@host[:port]` (also tolerates a pasted `ssh://…`). The full
-    // remote-agent stack attaches over SSH — remote filesystem + LSP + an
-    // in-host terminal — as a born-attached window, not just a local `ssh`
-    // terminal.
-    let raw = form.sshHost.value.trim();
-    if (raw.startsWith("ssh://")) raw = raw.slice("ssh://".length);
-    if (!raw) {
-      fail("SSH: Host (user@host) is required.");
-      return;
-    }
-    let port: number | null = null;
+    // Parse `[user@]host[:port]` (also tolerates a pasted `ssh://…`). The user
+    // is optional — a bare `host` lets ssh resolve the user from its own
+    // config / the current user. The full remote-agent stack attaches over SSH
+    // (remote filesystem + LSP + an in-host terminal) as a born-attached
+    // window, not just a local `ssh` terminal.
+    const raw = form.sshHost.value.trim().replace(/^ssh:\/\//, "");
+    // Split an optional `:port` suffix, then an optional `user@` prefix —
+    // computed up front so there are no half-parsed intermediate values.
     const portMatch = raw.match(/^(.+):(\d+)$/);
-    if (portMatch) {
-      raw = portMatch[1];
-      port = parseInt(portMatch[2], 10);
-    }
-    let user = "";
-    let host = raw;
-    const at = raw.indexOf("@");
-    if (at >= 0) {
-      user = raw.slice(0, at);
-      host = raw.slice(at + 1);
-    }
-    if (!user) {
-      fail("SSH: a user is required — use user@host.");
+    const port = portMatch ? parseInt(portMatch[2], 10) : null;
+    const hostPart = portMatch ? portMatch[1] : raw;
+    const at = hostPart.indexOf("@");
+    const user = at > 0 ? hostPart.slice(0, at) : undefined;
+    const host = at >= 0 ? hostPart.slice(at + 1) : hostPart;
+    if (!host) {
+      fail("SSH: a host is required (host, user@host, or ssh://host).");
       return;
     }
     const identity = form.sshIdentity.value.trim();
     const remotePath = form.sshPath.value.trim();
+    // Free-form extra ssh args, whitespace-split (e.g. `-J jump -o Foo=bar`).
+    const extraArgs = form.sshOptions.value.trim()
+      ? form.sshOptions.value.trim().split(/\s+/)
+      : [];
     const agentArgv = splitAgentCmd(cmd);
+    const target = user ? `${user}@${host}` : host;
     const spec: RemoteAgentSpec = {
       transport: {
         kind: "ssh",
-        user,
+        ...(user ? { user } : {}),
         host,
         port,
         identity_file: identity || null,
         remote_path: remotePath || null,
+        ...(extraArgs.length > 0 ? { extra_args: extraArgs } : {}),
       },
       base_env: [],
       window: true,
-      label: sessionName || `ssh:${user}@${host}`,
+      label: sessionName || `ssh:${target}`,
       command: agentArgv.length > 0 ? agentArgv : undefined,
     };
     if (cmd) editor.setGlobalState("orchestrator.last_cmd", cmd);
-    closeForm();
-    editor.setStatus(`Orchestrator: connecting SSH ${user}@${host}…`);
-    pendingRemoteFacet = { kind: "ssh", detail: `${user}@${host}`, state: "running" };
-    editor.attachRemoteAgent(spec);
+    await runRemoteAttach(spec, {
+      kind: "ssh",
+      detail: target,
+      state: "running",
+    });
     return;
   }
 
@@ -5251,13 +5913,13 @@ async function submitForm(): Promise<void> {
   form.submitting = true;
   form.lastError = null;
   renderForm();
+  // Disabled/connecting view exposes only Cancel — focus it.
+  formPanel?.setFocusKey("cancel");
 
-  // Honour the placeholder: when the user leaves Agent Command
-  // blank, fall back to `lastCmd` (the placeholder text). The
-  // placeholder is rendered as a hint — if the user accepts it by
-  // pressing Enter on an empty field, the dialog should actually
-  // run that command rather than silently spawning a bare shell.
-  const cmd = form.cmd.value.trim() || form.lastCmd.trim();
+  // The Agent Command field is prefilled with the last-used command as actual
+  // text (see `openForm`), so its value is authoritative: a cleared field means
+  // "spawn a bare terminal", not "silently reuse the last command".
+  const cmd = form.cmd.value.trim();
   const branchInput = form.branch.value.trim();
 
   // Project Path: typed value wins; otherwise the resolved
@@ -5404,6 +6066,11 @@ async function submitForm(): Promise<void> {
   // terminal IS the new window's seed buffer, so the window is
   // born with a single tab.
   const argv = splitAgentCmd(cmd);
+  // If this is a known coding agent, provision it so a restart rejoins the
+  // conversation: `launch` may carry a minted `--session-id`, and `resume` is
+  // what restore runs instead of re-launching (see the agent registry). The
+  // host persists `resume` on the terminal; `terminal.resume_agents` gates it.
+  const { launch: launchArgv, resume: resumeArgv } = resolveAgentLaunch(argv);
   // Shared only when we neither created a worktree nor attached to an
   // existing linked one (i.e. a non-git dir or the repo's main tree).
   const sharedWorktree = !createWorktree && !isLinkedAttach;
@@ -5412,8 +6079,9 @@ async function submitForm(): Promise<void> {
       root,
       label: sessionName,
       cwd: root,
-      command: argv.length > 0 ? argv : undefined,
-      title: argv.length > 0 ? argv[0] : undefined,
+      command: launchArgv.length > 0 ? launchArgv : undefined,
+      title: launchArgv.length > 0 ? launchArgv[0] : undefined,
+      resume: resumeArgv,
     });
     const id = result.windowId;
     // `createWindowWithTerminal` already dove into the new window,
@@ -5440,8 +6108,16 @@ async function submitForm(): Promise<void> {
       branch: reportedBranch || undefined,
     };
     orchestratorSessions.set(id, tracked);
-    // Refresh the dock so the freshly-created session shows up.
-    if (openPanel && dockMode) refreshOpenDialog();
+    // Refresh the dock so the freshly-created session shows up, then move
+    // the highlight onto it: it's now the active window, so the dock
+    // (blurred to hand focus to the new terminal) should point at it
+    // rather than leave the highlight on the previously-active row. The
+    // `active_window_changed` that fired mid-`createWindowWithTerminal`
+    // ran before this session was tracked, so it couldn't select it.
+    if (openPanel && dockMode) {
+      refreshOpenDialog();
+      syncDockSelectionToActive();
+    }
   } catch (e) {
     editor.setStatus(
       `Orchestrator: failed to start session — ${
@@ -5465,6 +6141,17 @@ async function attachToWorktree(opts: {
   label: string;
   branch?: string;
   discoveredId?: number;
+  /**
+   * Whether to hand keyboard focus to the new window (blur the dock) once
+   * attached. `true` for the "dive in" gestures (Enter, Visit) — mirrors
+   * the dock's live-session Enter, which blurs to the editor. `false`
+   * (default) for the "activate / live-switch" gestures (arrow-nav, a
+   * row click), which open the worktree as the active session but keep
+   * the dock focused so you can keep navigating — mirrors the dock's
+   * live-session arrow/click switch, which never blurs. No-op in the
+   * modal picker (it closes `openPanel` before calling here).
+   */
+  dive?: boolean;
 }): Promise<void> {
   try {
     const result = await editor.createWindowWithTerminal({
@@ -5490,6 +6177,25 @@ async function attachToWorktree(opts: {
       createdAt: Date.now(),
       branch: opts.branch,
     });
+    // The new window is now the active session. For a "dive in" gesture
+    // (Enter / Visit) the dock is still focused, so its keys would be
+    // swallowed and the new session's terminal couldn't receive input —
+    // mirror the dock's live-session Enter path and blur it so the new
+    // window gets the keyboard. The "activate / live-switch" gestures
+    // (arrow-nav, row click) deliberately keep the dock focused, exactly
+    // like switching to a live session does.
+    if (opts.dive && dockMode && openPanel) {
+      dockBlurred = true;
+      editor.floatingPanelControl(openPanel.id(), "blur", 0);
+      editor.setEditorMode(null);
+    } else if (dockMode && openPanel) {
+      // Live-switch: keep the dock focused, but rebuild the list (the
+      // `· on-disk` row's synthetic id is gone, replaced by the new live
+      // window's) and move the highlight onto the now-active session so
+      // the user stays put on the row they just opened.
+      refreshOpenDialog();
+      syncDockSelectionToActive();
+    }
   } catch (e) {
     editor.setStatus(
       `Orchestrator: failed to attach session — ${
@@ -5614,10 +6320,12 @@ function switchTabIfFocused(delta: 1 | -1): boolean {
 }
 registerHandler("orchestrator_form_key_left", () => {
   if (switchTabIfFocused(-1)) return;
+  if (switchAgentIfFocused(-1)) return;
   dispatchFormKey("Left");
 });
 registerHandler("orchestrator_form_key_right", () => {
   if (switchTabIfFocused(1)) return;
+  if (switchAgentIfFocused(1)) return;
   dispatchFormKey("Right");
 });
 registerHandler("orchestrator_form_key_up", () => {
@@ -5744,6 +6452,59 @@ function enterBulkConfirm(action: BulkAction): void {
 
 editor.on("widget_event", (e) => {
   // ---------------------------------------------------------------------
+  // Dock session context menu (right-click): Visit / Archive / Delete.
+  // ---------------------------------------------------------------------
+  if (dockMenuPanel && dockMenuState && e.panel_id === dockMenuPanel.id()) {
+    const id = dockMenuState.sessionId;
+    if (e.event_type === "cancel") {
+      // Esc or a click outside dismissed the popup — the host already
+      // unmounted the panel, so just drop our handle (don't unmount it
+      // again) and hand keyboard focus back to the dock.
+      dockMenuPanel = null;
+      dockMenuState = null;
+      if (openPanel && dockMode) {
+        dockBlurred = false;
+        dockFocus = "list";
+        editor.floatingPanelControl(openPanel.id(), "focus", 0);
+        openPanel.setFocusKey("sessions");
+        refreshOpenDialog();
+      }
+      return;
+    }
+    if (e.event_type === "activate") {
+      if (e.widget_key === "ctx-visit") {
+        // Visit dives into the editor — no dock refocus.
+        closeDockContextMenu();
+        dockMenuVisit(id);
+        return;
+      }
+      if (e.widget_key === "ctx-archive" && bulkEligible("archive", id)) {
+        dockMenuEnterConfirm("archive");
+        return;
+      }
+      if (e.widget_key === "ctx-delete" && bulkEligible("delete", id)) {
+        dockMenuEnterConfirm("delete");
+        return;
+      }
+      if (e.widget_key === "confirm-cancel") {
+        // Back to the anchored menu (not all the way out) so a mis-click
+        // on a destructive action is one click from recoverable.
+        dockMenuState = { ...dockMenuState, stage: "menu" };
+        renderDockMenu();
+        anchorDockMenu();
+        return;
+      }
+      if (e.widget_key === "confirm-archive" || e.widget_key === "confirm-delete") {
+        const action = e.widget_key === "confirm-archive" ? "archive" : "delete";
+        closeDockContextMenuAndRestoreDock();
+        void runConfirmedAction(action, [id]);
+        return;
+      }
+    }
+    return;
+  }
+
+  // ---------------------------------------------------------------------
   // New-session form
   // ---------------------------------------------------------------------
   if (form && formPanel && e.panel_id === formPanel.id()) {
@@ -5779,6 +6540,8 @@ editor.on("widget_event", (e) => {
         ? form.sshPath
         : field === "ssh_identity"
         ? form.sshIdentity
+        : field === "ssh_options"
+        ? form.sshOptions
         : field === "k8s_target"
         ? form.k8sTarget
         : field === "k8s_context"
@@ -5869,6 +6632,14 @@ editor.on("widget_event", (e) => {
         }
         return;
       }
+      const preset = agentPresets().find((p) => p.key === e.widget_key);
+      if (preset && form) {
+        // Click on a dropdown choice: fill the command (or, for "custom…",
+        // hand focus to the free-text field). The field stays editable for
+        // arguments / custom agents either way.
+        applyAgentPreset(preset);
+        return;
+      }
       if (e.widget_key === "create") {
         void submitForm();
       } else if (e.widget_key === "cancel") {
@@ -5881,6 +6652,12 @@ editor.on("widget_event", (e) => {
       // mirror our own state and (if reached from the picker)
       // bounce back to the picker so Esc is "back", not "out".
       const wasFromPicker = !!form?.fromPicker;
+      // Esc while connecting aborts the in-flight remote attach, same as the
+      // Cancel button: reject the promise and discard the late result host-side.
+      if (form?.submitting) {
+        pendingRemoteFacet = null;
+        editor.cancelRemoteAgent();
+      }
       form = null;
       formPanel = null;
       editor.setEditorMode(null);
@@ -5968,11 +6745,12 @@ editor.on("widget_event", (e) => {
       return;
     }
     if (e.event_type === "dock_activate") {
-      // Host Enter on the dock's session list. Mirrors the dialog's
-      // `activate` branch: a discovered (on-disk) worktree has no live
-      // window to switch to, so attach a fresh session at it; any other
-      // row is already active via the arrow live-switch, so Enter just
-      // hands keyboard focus to the editor (the dock stays visible).
+      // Host Enter on the dock's session list — the "dive in" gesture.
+      // Every row is already the active session via the arrow/click
+      // live-switch (a discovered worktree was opened on navigation too),
+      // so Enter just hands keyboard focus to the editor. If the row is
+      // still discovered here (Enter pressed before the debounced switch
+      // landed) attach it now, diving in to match the live path below.
       if (!dockMode || !openPanel || !openDialog) return;
       const id = openDialog.filteredIds[openDialog.selectedIndex];
       const sel = typeof id === "number" ? orchestratorSessions.get(id) : undefined;
@@ -5983,6 +6761,7 @@ editor.on("widget_event", (e) => {
           label: sel.label,
           branch: sel.branch,
           discoveredId: sel.id,
+          dive: true,
         });
         return;
       }
@@ -6005,10 +6784,32 @@ editor.on("widget_event", (e) => {
     if (e.event_type === "dock_toggle_scope") {
       // The dock's scope control is now the project dropdown; Alt+P
       // opens/closes it instead of flipping the old current/all scope.
+      // Opening hands the keyboard to the menu; closing returns it to
+      // the session list.
       if (dockMode) {
-        openDialog.projectMenuOpen = !openDialog.projectMenuOpen;
-        if (openPanel) openPanel.update(buildDockSpec());
+        if (openDialog.projectMenuOpen) closeProjectMenu();
+        else openProjectMenu();
       }
+      return;
+    }
+    // Dock project dropdown keyboard nav. The host fires these only
+    // while panel focus sits on a `project-pick:` row (i.e. the menu is
+    // open and owns the keyboard), so ↑/↓/Enter/Esc drive the dropdown
+    // instead of leaking to the session list underneath.
+    if (e.event_type === "dock_menu_prev") {
+      moveProjectMenu(-1);
+      return;
+    }
+    if (e.event_type === "dock_menu_next") {
+      moveProjectMenu(1);
+      return;
+    }
+    if (e.event_type === "dock_menu_accept") {
+      acceptProjectMenu();
+      return;
+    }
+    if (e.event_type === "dock_menu_cancel") {
+      closeProjectMenu();
       return;
     }
     if (e.event_type === "change" && e.widget_key === "filter") {
@@ -6033,6 +6834,21 @@ editor.on("widget_event", (e) => {
       refreshOpenDialog();
       return;
     }
+    // Right-click on a session row → open its context menu. Only the
+    // dock wires this up (the host fires `context` for right-clicks in
+    // the dock column); the modal picker has its own action buttons.
+    if (
+      e.event_type === "context" &&
+      dockMode &&
+      ((e.payload ?? {}) as Record<string, unknown>).list_key === "sessions"
+    ) {
+      const payload = (e.payload ?? {}) as Record<string, unknown>;
+      const idx = payload.index;
+      const col = typeof payload.col === "number" ? payload.col : 0;
+      const row = typeof payload.row === "number" ? payload.row : 0;
+      if (typeof idx === "number") openDockContextMenu(idx, col, row);
+      return;
+    }
     // List selection. Keyboard nav fires this with `widget_key`
     // "sessions" (the list's own key); a mouse click on a row fires it
     // with `widget_key` set to the clicked item's key, carrying the
@@ -6045,17 +6861,17 @@ editor.on("widget_event", (e) => {
     ) {
       const payload = (e.payload ?? {}) as Record<string, unknown>;
       const idx = payload.index;
-      console.warn(
-        `[dock-select] event reached plugin: idx=${idx} widget_key=${e.widget_key} dockMode=${dockMode} dockBlurred=${dockBlurred}`,
-      );
       if (typeof idx === "number") {
         const prevIdx = openDialog.selectedIndex;
         openDialog.selectedIndex = idx;
         clearDialogError();
         if (dockMode) {
-          // The editor to the dock's right is the preview: arrowing
-          // the list switches the active window live (debounced),
-          // wiping down when moving down the list and up when moving up.
+          // The editor to the dock's right is the preview: arrowing the
+          // list (or clicking a row) switches the active window live
+          // (debounced), wiping down when moving down and up when moving
+          // up. A discovered (on-disk) worktree has no window to switch
+          // to, so `scheduleDockSwitch` opens it as the active session
+          // instead — both click and arrow land there the same way.
           openPanel.update(buildDockSpec());
           openPanel.setSelectedIndex("sessions", openDialog.selectedIndex);
           const fromEdge = idx > prevIdx ? "bottom" : idx < prevIdx ? "top" : null;
@@ -6067,6 +6883,29 @@ editor.on("widget_event", (e) => {
         // Re-pin the list selection so the spec re-emit doesn't
         // snap it back to 0.
         openPanel.setSelectedIndex("sessions", openDialog.selectedIndex);
+        // A mouse click on an inactive on-disk worktree opens it
+        // directly — no Enter/Visit "confirmation" needed. There's no
+        // live window to switch to, so attach a fresh session, mirroring
+        // the dialog's Visit (`activate`) path. Live rows keep
+        // select+preview (opened with Enter / Visit). Arrow-nav fires
+        // `select` without `via`, so it only previews.
+        if (payload.via === "click") {
+          const clickedId = openDialog.filteredIds[openDialog.selectedIndex];
+          const clicked = typeof clickedId === "number"
+            ? orchestratorSessions.get(clickedId)
+            : undefined;
+          if (clicked && clicked.discovered) {
+            closeOpenDialog();
+            void attachToWorktree({
+              root: clicked.root,
+              projectPath: clicked.projectPath ?? clicked.root,
+              label: clicked.label,
+              branch: clicked.branch,
+              discoveredId: clicked.id,
+            });
+            return;
+          }
+        }
         // Up/Down on a focused action button (Stop / Archive /
         // Delete / Details / +New Session) routes to the sessions
         // list via the host's smart-key dispatch but leaves focus
@@ -6144,8 +6983,8 @@ editor.on("widget_event", (e) => {
     // Dock project dropdown: the toolbar button toggles the menu open,
     // and each option button picks a project (empty suffix = all).
     if (e.event_type === "activate" && e.widget_key === "project-menu") {
-      openDialog.projectMenuOpen = !openDialog.projectMenuOpen;
-      if (openPanel) openPanel.update(buildDockSpec());
+      if (openDialog.projectMenuOpen) closeProjectMenu();
+      else openProjectMenu();
       return;
     }
     if (
@@ -6153,21 +6992,7 @@ editor.on("widget_event", (e) => {
       typeof e.widget_key === "string" &&
       e.widget_key.startsWith("project-pick:")
     ) {
-      const key = e.widget_key.slice("project-pick:".length);
-      openDialog.projectFilter = key === "" ? null : key;
-      lastDockProjectFilter = openDialog.projectFilter;
-      openDialog.projectMenuOpen = false;
-      // Re-filter to the chosen project and keep the active session
-      // selected when it's still in view.
-      const activeId = editor.activeWindow();
-      const next = filterSessions(openDialog.filter.value);
-      openDialog.filteredIds = next;
-      const activeIdx = next.indexOf(activeId);
-      openDialog.selectedIndex = activeIdx >= 0 ? activeIdx : 0;
-      refreshOpenDialog();
-      if (openPanel && next.length > 0) {
-        openPanel.setSelectedIndex("sessions", openDialog.selectedIndex);
-      }
+      pickProject(e.widget_key.slice("project-pick:".length));
       return;
     }
     if (e.event_type === "activate" && e.widget_key === "scope-toggle") {
@@ -6326,6 +7151,12 @@ editor.on("active_window_changed", () => {
   const s = orchestratorSessions.get(editor.activeWindow());
   if (s) s.activatedAt = Date.now();
   refreshOpenDialog();
+  // A passive (blurred) dock mirrors the active window, so keep its
+  // highlighted row in sync when focus moves to another window from
+  // outside the dock. While the dock holds focus the user drives ↑/↓
+  // selection (and the debounced live-switch already aligns the two), so
+  // re-selecting here would fight the scroll — hence the blurred guard.
+  if (dockBlurred) syncDockSelectionToActive();
 });
 
 // Re-flow the open-picker on terminal resize. The dialog's
